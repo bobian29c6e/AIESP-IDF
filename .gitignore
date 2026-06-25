@@ -1,0 +1,30 @@
+# Build outputs
+build/
+.cache/
+sdkconfig.old
+
+# ESP-IDF managed dependencies are restored from idf_component.yml/dependencies.lock
+managed_components/
+
+# Local/debug artifacts
+_local_artifacts/
+logs/
+_debug_archives/
+*.log
+upload_20_results.json
+upload_test_serial.log
+
+# Local editor/agent files
+.DS_Store
+.claude/
+.vscode/
+.idea/
+
+# Temporary patch scripts
+patch*.py
+revert*.py
+*.patch
+
+# Backup/duplicate files
+*backup*
+* 2.*

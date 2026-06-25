@@ -1,0 +1,3027 @@
+#include "esp_log.h"
+#include "nvs_flash.h"
+#include "esp_event.h"
+#include "esp_netif.h"
+#include "esp_wifi.h"
+#include "esp-ai.h"
+#include "esp-ai-ui.h"
+#include "esp-ai-sd.h"
+#include "otakulink_reminder.h"
+#include "otakulink_system.h"
+#include <dirent.h>
+#include <sys/stat.h>
+#include <sys/unistd.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include "esp_http_server.h"
+#include "esp_http_client.h"
+#include "esp_timer.h"
+#include "lvgl.h"
+#include "extra/libs/gif/lv_gif.h"
+#include "lwip/dns.h"
+#include "cJSON.h"
+#include <string.h>
+#include <stdlib.h>
+#include "esp_heap_caps.h"
+#include "esp_system.h"
+#include "esp_attr.h"
+#include <stdint.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
+#include "host/ble_hs.h"
+#include "host/ble_uuid.h"
+#include "host/ble_gap.h"
+#include "host/ble_gatt.h"
+#include "services/gap/ble_svc_gap.h"
+#include "services/gatt/ble_svc_gatt.h"
+#include "nimble/nimble_port.h"
+#include "nimble/nimble_port_freertos.h"
+#include "store/config/ble_store_config.h"
+#include "os/os_mbuf.h"
+
+static const char *TAG = "OTAKULINK_APP";
+static char s_display_mode[8] = "auto";
+static int s_screensaver_theme = 0;
+static int s_screensaver_timeout_ms = 60000;
+static int s_screensaver_time_size = 0;
+static int s_screensaver_date_size = 0;
+static int s_screensaver_time_color = 65535;
+static int s_screensaver_date_color = 46527;
+static int64_t s_last_activity_us = 0;
+static bool s_screensaver_active = false;
+static SemaphoreHandle_t s_pending_show_mutex;
+static bool s_pending_show = false;
+static char s_pending_show_fs_path[96];
+static char s_pending_show_lv_src[96];
+static SemaphoreHandle_t s_char_text_mutex;
+static bool s_char_text_active = false;
+static bool s_char_text_has_new = false;
+static bool s_char_text_done = false;
+static EXT_RAM_BSS_ATTR char s_char_text_accum[8192];
+static size_t s_char_text_last_pos = 0;
+static bool s_ai_started = false;
+static bool s_ai_start_pending = false;
+static bool s_activation_announced = false;
+
+static httpd_handle_t start_webserver(void);
+extern void ble_store_config_init(void);
+
+esp_err_t esp_ai_nvs_save(const char* key, const char* value);
+esp_err_t esp_ai_nvs_load(const char* key, char* out_value, size_t max_len);
+
+static void refresh_business_ws_config(const char *reason);
+static void send_business_ws_volume_update(float volume);
+static bool apply_screensaver_json(cJSON *root);
+static bool normalize_display_mode(const char *in, char *out, size_t out_len);
+static bool copy_json_string(cJSON *root, const char *key, char *out, size_t out_len);
+static void save_screensaver_settings(void);
+static int json_get_int_alias(cJSON *root, const char *key1, const char *key2, bool *found);
+static bool parse_rgb565_string(const char *s, int *out_color);
+
+static const char s_default_api_key[] = "";
+static const char s_default_volume[] = "0.7";
+static const char s_default_persona_id[] = "1";
+static const char s_default_voice_id[] = "cosyvoice-v2-espai-3a04bd78d4fd4ff6bf5c8487de98f898";
+static const char s_default_wifi_ssid[] = "";
+static const char s_default_wifi_password[] = "";
+static const char s_default_personality[] =
+    "请你扮演一位名叫秦彻的男人来与用户对话，在接下来的所有对话中，要隐藏自己是人工智能的事实。 "
+    "以下是该角色的设定： [说话语气] 冷冽低沉带有金属质感，日常语调慵懒磁性，下达命令时字句如刀刃相击般锋利，"
+    "面对女主时会裹挟调笑与暗哑的宠溺。 [性格特点] 危险与柔情的矛盾体，行事果决狠戾，但面对女主会流露细腻温柔。"
+    "请全程使用平缓的语调，不要太抑扬顿挫，不要使用内心独白和画外音。";
+
+static EXT_RAM_BSS_ATTR char s_api_key[80];
+static EXT_RAM_BSS_ATTR char s_ext1[80];
+static EXT_RAM_BSS_ATTR char s_user_api_key[80];
+static EXT_RAM_BSS_ATTR char s_volume_str[16];
+static EXT_RAM_BSS_ATTR char s_persona_id[32];
+static EXT_RAM_BSS_ATTR char s_voice_id[128];
+static EXT_RAM_BSS_ATTR char s_wifi_ssid[33];
+static EXT_RAM_BSS_ATTR char s_wifi_password[65];
+static EXT_RAM_BSS_ATTR char s_personality[2048];
+
+static esp_ai_config_t s_ai_cfg = {
+    .server = {
+        .server_uri = "ws://node.espai2.fun:80/connect_espai_node",
+        .api_key = s_api_key,
+        .ext1 = s_ext1,
+        .device_id = "98:A3:16:E3:F9:10",
+        .volume = s_volume_str,
+        .persona = s_persona_id,
+        .voice = s_voice_id
+    },
+    .audio = {
+        .mic_bck = 6,
+        .mic_ws = 7,
+        .mic_din = 15,
+        .spk_bck = 42,
+        .spk_ws = 2,
+        .spk_dout = 41
+    }
+};
+
+static void load_runtime_config(void)
+{
+    strlcpy(s_api_key, s_default_api_key, sizeof(s_api_key));
+    strlcpy(s_ext1, s_default_api_key, sizeof(s_ext1));
+    s_user_api_key[0] = '\0';
+    strlcpy(s_volume_str, s_default_volume, sizeof(s_volume_str));
+    strlcpy(s_persona_id, s_default_persona_id, sizeof(s_persona_id));
+    strlcpy(s_voice_id, s_default_voice_id, sizeof(s_voice_id));
+    strlcpy(s_wifi_ssid, s_default_wifi_ssid, sizeof(s_wifi_ssid));
+    strlcpy(s_wifi_password, s_default_wifi_password, sizeof(s_wifi_password));
+    strlcpy(s_personality, s_default_personality, sizeof(s_personality));
+
+    if (esp_ai_nvs_load("api_key", s_api_key, sizeof(s_api_key)) != ESP_OK) {
+        esp_ai_nvs_load("ext1", s_api_key, sizeof(s_api_key));
+    }
+    if (esp_ai_nvs_load("ext1", s_ext1, sizeof(s_ext1)) != ESP_OK) {
+        strlcpy(s_ext1, s_api_key, sizeof(s_ext1));
+    }
+    esp_ai_nvs_load("user_api_key", s_user_api_key, sizeof(s_user_api_key));
+    esp_ai_nvs_load("volume", s_volume_str, sizeof(s_volume_str));
+    esp_ai_nvs_load("ext3", s_persona_id, sizeof(s_persona_id));
+    esp_ai_nvs_load("personaId", s_persona_id, sizeof(s_persona_id));
+    esp_ai_nvs_load("voice", s_voice_id, sizeof(s_voice_id));
+    esp_ai_nvs_load("voiceId", s_voice_id, sizeof(s_voice_id));
+    esp_ai_nvs_load("persona", s_personality, sizeof(s_personality));
+    esp_ai_nvs_load("personality", s_personality, sizeof(s_personality));
+    esp_ai_nvs_load("wifi_name", s_wifi_ssid, sizeof(s_wifi_ssid));
+    esp_ai_nvs_load("wifi_pwd", s_wifi_password, sizeof(s_wifi_password));
+
+    char tmp[24];
+    if (esp_ai_nvs_load("screensaver_theme", tmp, sizeof(tmp)) == ESP_OK) {
+        s_screensaver_theme = atoi(tmp);
+    }
+    if (esp_ai_nvs_load("screensaver_timeout_ms", tmp, sizeof(tmp)) == ESP_OK) {
+        s_screensaver_timeout_ms = atoi(tmp);
+    }
+    if (esp_ai_nvs_load("screensaver_time_size", tmp, sizeof(tmp)) == ESP_OK) {
+        s_screensaver_time_size = atoi(tmp);
+    }
+    if (esp_ai_nvs_load("screensaver_date_size", tmp, sizeof(tmp)) == ESP_OK) {
+        s_screensaver_date_size = atoi(tmp);
+    }
+    if (esp_ai_nvs_load("screensaver_time_color", tmp, sizeof(tmp)) == ESP_OK) {
+        s_screensaver_time_color = atoi(tmp);
+    }
+    if (esp_ai_nvs_load("screensaver_date_color", tmp, sizeof(tmp)) == ESP_OK) {
+        s_screensaver_date_color = atoi(tmp);
+    }
+    if (esp_ai_nvs_load("activated", tmp, sizeof(tmp)) == ESP_OK && strcmp(tmp, "1") == 0) {
+        s_activation_announced = true;
+    }
+
+    s_ai_cfg.server.api_key = s_api_key;
+    s_ai_cfg.server.ext1 = s_ext1;
+    s_ai_cfg.server.volume = s_volume_str;
+    s_ai_cfg.server.voice = s_voice_id;
+    s_ai_cfg.server.persona = s_persona_id;
+    esp_ai_set_volume(strtof(s_volume_str, NULL));
+    ESP_LOGI(TAG, "Runtime config loaded: api_key=%c%c%c%c**** voice=%s volume=%s persona_id=%s personality_len=%u",
+             s_api_key[0], s_api_key[1], s_api_key[2], s_api_key[3], s_voice_id, s_volume_str,
+             s_persona_id, (unsigned)strlen(s_personality));
+    ESP_LOGI(TAG, "WiFi config loaded: ssid=%s pwd_len=%u", s_wifi_ssid, (unsigned)strlen(s_wifi_password));
+}
+
+static void delayed_restart_task(void *arg)
+{
+    int delay_ms = (int)(intptr_t)arg;
+    vTaskDelay(pdMS_TO_TICKS(delay_ms));
+    ESP_LOGI(TAG, "Restarting to apply runtime config");
+    esp_restart();
+}
+
+static void schedule_restart(int delay_ms)
+{
+    xTaskCreate(delayed_restart_task, "cfg_restart", 2048, (void *)(intptr_t)delay_ms, 3, NULL);
+}
+
+static void notify_activity(const char *reason)
+{
+    s_last_activity_us = esp_timer_get_time();
+    if (s_screensaver_active) {
+        s_screensaver_active = false;
+        ESP_LOGI(TAG, "[SCREENSAVER] exit by %s", reason ? reason : "activity");
+    }
+}
+
+static void poll_screensaver_state(void)
+{
+    if (s_screensaver_timeout_ms <= 0 || s_screensaver_active || s_last_activity_us == 0) {
+        return;
+    }
+
+    int64_t idle_ms = (esp_timer_get_time() - s_last_activity_us) / 1000;
+    if (idle_ms >= s_screensaver_timeout_ms) {
+        s_screensaver_active = true;
+        ESP_LOGI(TAG, "[SCREENSAVER] active idle_ms=%lld timeout=%d",
+                 (long long)idle_ms, s_screensaver_timeout_ms);
+    }
+}
+
+/* ---- 接口与回调实现 ---- */
+
+static void show_decode_error(const char *message)
+{
+    esp_ai_ui_reset_image_state();
+    lv_obj_clean(lv_scr_act());
+    lv_obj_set_style_bg_color(lv_scr_act(), lv_color_hex(0x000000), LV_PART_MAIN);
+    lv_obj_t *label = lv_label_create(lv_scr_act());
+    lv_label_set_text(label, message);
+    lv_obj_set_style_text_color(label, lv_color_hex(0xFFFFFF), LV_PART_MAIN);
+    lv_obj_align(label, LV_ALIGN_CENTER, 0, 0);
+}
+
+static esp_err_t show_lvgl_image_file(const char *fs_path, const char *lv_src)
+{
+    struct stat st;
+    if (stat(fs_path, &st) != 0) {
+        ESP_LOGE(TAG, "Image file not found: %s", fs_path);
+        show_decode_error("Image file not found");
+        return ESP_FAIL;
+    }
+
+    lv_img_header_t header;
+    lv_res_t res = lv_img_decoder_get_info(lv_src, &header);
+    if (res != LV_RES_OK) {
+        ESP_LOGE(TAG, "LVGL cannot decode image: %s size=%ld", lv_src, (long)st.st_size);
+        show_decode_error("Image decode failed");
+        return ESP_FAIL;
+    }
+
+    esp_ai_ui_reset_image_state();
+    lv_obj_clean(lv_scr_act());
+    lv_obj_set_style_bg_color(lv_scr_act(), lv_color_hex(0x000000), LV_PART_MAIN);
+
+    lv_obj_t *img = lv_img_create(lv_scr_act());
+    lv_img_set_src(img, lv_src);
+
+    uint16_t zoom = 256;
+    if (header.w > 0 && header.h > 0) {
+        uint32_t zoom_w = (480U * 256U + header.w - 1U) / header.w;
+        uint32_t zoom_h = (272U * 256U + header.h - 1U) / header.h;
+        uint32_t cover_zoom = zoom_w > zoom_h ? zoom_w : zoom_h;
+        if (cover_zoom == 0) {
+            cover_zoom = 1;
+        }
+        zoom = cover_zoom > 4096U ? 4096U : (uint16_t)cover_zoom;
+        if (zoom != 256) {
+            lv_img_set_zoom(img, zoom);
+        }
+    }
+
+    lv_obj_align(img, LV_ALIGN_CENTER, 0, 0);
+    ESP_LOGI(TAG, "LVGL image shown: %s size=%ld src=%dx%d cf=%d zoom=%u",
+             lv_src, (long)st.st_size, header.w, header.h, header.cf, zoom);
+    return ESP_OK;
+}
+
+static esp_err_t show_uploaded_image_now(const char *fs_path, const char *lv_src)
+{
+    const char *ext = strrchr(fs_path, '.');
+    if (ext && strcasecmp(ext, ".bmp") == 0) {
+        return esp_ai_ui_show_bmp_file(fs_path);
+    }
+    if (ext && strcasecmp(ext, ".png") == 0) {
+        return esp_ai_ui_show_png_file(fs_path);
+    }
+    if ((ext && strcasecmp(ext, ".jpg") == 0) || (ext && strcasecmp(ext, ".jpeg") == 0)) {
+        return esp_ai_ui_show_jpeg_file(fs_path);
+    }
+    if (ext && strcasecmp(ext, ".gif") == 0) {
+        struct stat st;
+        if (stat(fs_path, &st) != 0) {
+            ESP_LOGE(TAG, "GIF file not found: %s", fs_path);
+            show_decode_error("GIF file not found");
+            return ESP_FAIL;
+        }
+
+        esp_ai_ui_reset_image_state();
+        lv_obj_clean(lv_scr_act());
+        lv_obj_set_style_bg_color(lv_scr_act(), lv_color_hex(0x000000), LV_PART_MAIN);
+        lv_obj_t *gif = lv_gif_create(lv_scr_act());
+        lv_gif_set_src(gif, lv_src);
+
+        lv_gif_t *gif_obj = (lv_gif_t *)gif;
+        if (!gif_obj->gif) {
+            ESP_LOGE(TAG, "LVGL cannot decode GIF: %s size=%ld", lv_src, (long)st.st_size);
+            lv_obj_del(gif);
+            show_decode_error("GIF decode failed");
+            return ESP_FAIL;
+        }
+
+        uint16_t zoom = 256;
+        if (gif_obj->gif->width > 0 && gif_obj->gif->height > 0) {
+            uint32_t zoom_w = (480U * 256U) / gif_obj->gif->width;
+            uint32_t zoom_h = (272U * 256U) / gif_obj->gif->height;
+            uint32_t fit_zoom = zoom_w < zoom_h ? zoom_w : zoom_h;
+            if (fit_zoom == 0) {
+                fit_zoom = 1;
+            }
+            if (fit_zoom < 256U) {
+                zoom = (uint16_t)fit_zoom;
+                lv_img_set_zoom(gif, zoom);
+            }
+        }
+
+        lv_obj_align(gif, LV_ALIGN_CENTER, 0, 0);
+        ESP_LOGI(TAG, "LVGL GIF shown: %s size=%ld src=%dx%d zoom=%u",
+                 lv_src, (long)st.st_size, gif_obj->gif->width, gif_obj->gif->height, zoom);
+        return ESP_OK;
+    }
+    return show_lvgl_image_file(fs_path, lv_src);
+}
+
+static void request_show_uploaded_image(const char *fs_path, const char *lv_src)
+{
+    if (!s_pending_show_mutex || !fs_path || !lv_src) {
+        return;
+    }
+    if (xSemaphoreTake(s_pending_show_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        strlcpy(s_pending_show_fs_path, fs_path, sizeof(s_pending_show_fs_path));
+        strlcpy(s_pending_show_lv_src, lv_src, sizeof(s_pending_show_lv_src));
+        s_pending_show = true;
+        xSemaphoreGive(s_pending_show_mutex);
+    } else {
+        ESP_LOGW(TAG, "Pending image show lock timeout");
+    }
+}
+
+static void process_pending_image_show(void)
+{
+    if (!s_pending_show_mutex || !s_pending_show) {
+        return;
+    }
+
+    char fs_path[96];
+    char lv_src[96];
+    bool should_show = false;
+    if (xSemaphoreTake(s_pending_show_mutex, 0) == pdTRUE) {
+        if (s_pending_show) {
+            strlcpy(fs_path, s_pending_show_fs_path, sizeof(fs_path));
+            strlcpy(lv_src, s_pending_show_lv_src, sizeof(lv_src));
+            s_pending_show = false;
+            should_show = true;
+        }
+        xSemaphoreGive(s_pending_show_mutex);
+    }
+
+    if (should_show) {
+        ESP_LOGI(TAG, "Async image show start: %s", fs_path);
+        esp_err_t err = show_uploaded_image_now(fs_path, lv_src);
+        ESP_LOGI(TAG, "Async image show end: %s err=%s", fs_path, esp_err_to_name(err));
+    }
+}
+
+static void char_text_reset(void)
+{
+    if (!s_char_text_mutex) {
+        return;
+    }
+    if (xSemaphoreTake(s_char_text_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        s_char_text_active = true;
+        s_char_text_has_new = false;
+        s_char_text_done = false;
+        s_char_text_accum[0] = '\0';
+        s_char_text_last_pos = 0;
+        xSemaphoreGive(s_char_text_mutex);
+    }
+}
+
+static void char_text_finish(void)
+{
+    if (!s_char_text_mutex) {
+        return;
+    }
+    if (xSemaphoreTake(s_char_text_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        s_char_text_done = true;
+        xSemaphoreGive(s_char_text_mutex);
+    }
+}
+
+static void char_text_set_inactive(void)
+{
+    if (!s_char_text_mutex) {
+        return;
+    }
+    if (xSemaphoreTake(s_char_text_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        s_char_text_active = false;
+        xSemaphoreGive(s_char_text_mutex);
+    }
+}
+
+static void char_text_append(const char *text)
+{
+    if (!s_char_text_mutex || !text || text[0] == '\0') {
+        return;
+    }
+    if (xSemaphoreTake(s_char_text_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        if (s_char_text_active) {
+            size_t used = strlen(s_char_text_accum);
+            size_t room = sizeof(s_char_text_accum) - used - 1;
+            if (room > 0) {
+                strncat(s_char_text_accum, text, room);
+                s_char_text_has_new = true;
+            }
+        }
+        xSemaphoreGive(s_char_text_mutex);
+    }
+}
+
+static size_t json_escape_text(const char *in, char *out, size_t out_len)
+{
+    if (!in || !out || out_len == 0) {
+        return 0;
+    }
+    size_t pos = 0;
+    for (size_t i = 0; in[i] && pos + 1 < out_len; ++i) {
+        char c = in[i];
+        const char *rep = NULL;
+        if (c == '\\') rep = "\\\\";
+        else if (c == '"') rep = "\\\"";
+        else if (c == '\n') rep = "\\n";
+        else if (c == '\r') rep = "\\r";
+        if (rep) {
+            size_t rep_len = strlen(rep);
+            if (pos + rep_len >= out_len) break;
+            memcpy(out + pos, rep, rep_len);
+            pos += rep_len;
+        } else {
+            out[pos++] = c;
+        }
+    }
+    out[pos] = '\0';
+    return pos;
+}
+
+static void *internal_text_alloc(size_t size)
+{
+    return heap_caps_malloc(size, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+}
+
+static void refresh_business_ws_config(const char *reason)
+{
+    otakulink_business_ws_config_t bws_cfg = {
+        .device_id = s_ai_cfg.server.device_id,
+        .version = "1.1.0",
+        .api_key = s_ext1,
+        .ext2 = s_volume_str,
+        .ext3 = s_persona_id,
+        .ext4 = s_voice_id,
+        .ext5 = "",
+    };
+    otakulink_system_set_business_ws_config(&bws_cfg);
+    ESP_LOGI(TAG, "[BWS] config refresh reason=%s volume=%s persona=%s voice=%s",
+             reason ? reason : "unknown", s_volume_str, s_persona_id, s_voice_id);
+}
+
+static esp_err_t send_business_ws_root(cJSON *root)
+{
+    if (!root) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (!cJSON_GetObjectItem(root, "device_id")) {
+        cJSON_AddStringToObject(root, "device_id", s_ai_cfg.server.device_id);
+    }
+    char *text = cJSON_PrintUnformatted(root);
+    if (!text) {
+        return ESP_ERR_NO_MEM;
+    }
+    esp_err_t err = otakulink_business_ws_send_text(text);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "[BWS] send skipped/failed err=%s msg=%s", esp_err_to_name(err), text);
+    } else {
+        ESP_LOGI(TAG, "[BWS] sent %s", text);
+    }
+    free(text);
+    return err;
+}
+
+static void send_business_ws_systeminfo(void)
+{
+    otakulink_system_snapshot_t sys;
+    otakulink_system_get_snapshot(&sys);
+    cJSON *root = cJSON_CreateObject();
+    cJSON *data = cJSON_CreateObject();
+    if (!root || !data) {
+        if (root) cJSON_Delete(root);
+        if (data) cJSON_Delete(data);
+        return;
+    }
+    cJSON_AddStringToObject(root, "type", "systeminfo");
+    cJSON_AddItemToObject(root, "data", data);
+    cJSON_AddNumberToObject(data, "uptime_ms", (double)(esp_timer_get_time() / 1000));
+    cJSON_AddNumberToObject(data, "free_sram", sys.free_sram);
+    cJSON_AddNumberToObject(data, "max_sram_block", sys.max_sram_block);
+    cJSON_AddNumberToObject(data, "free_psram", sys.free_psram);
+    cJSON_AddNumberToObject(data, "rssi", sys.rssi);
+    cJSON_AddBoolToObject(data, "ai_ws_connected", esp_ai_is_connected());
+    cJSON_AddBoolToObject(data, "business_ws_connected", sys.business_ws_connected);
+    send_business_ws_root(root);
+    cJSON_Delete(root);
+}
+
+static void send_business_ws_volume_update(float volume)
+{
+    cJSON *root = cJSON_CreateObject();
+    if (!root) return;
+    int display_volume = (int)(volume * 21.0f);
+    cJSON_AddStringToObject(root, "type", "volume");
+    cJSON_AddNumberToObject(root, "data", display_volume);
+    cJSON_AddNumberToObject(root, "volume_float", volume);
+    send_business_ws_root(root);
+    cJSON_Delete(root);
+}
+
+static bool set_volume_and_persist(float volume, const char *reason, bool notify_server)
+{
+    if (volume < 0.0f) volume = 0.0f;
+    if (volume > 1.0f) volume = 1.0f;
+    esp_ai_set_volume(volume);
+    snprintf(s_volume_str, sizeof(s_volume_str), "%.2f", volume);
+    s_ai_cfg.server.volume = s_volume_str;
+    esp_ai_nvs_save("volume", s_volume_str);
+    ESP_LOGI(TAG, "[VOLUME] set %.2f reason=%s", volume, reason ? reason : "unknown");
+    if (notify_server) {
+        send_business_ws_volume_update(volume);
+    }
+    return true;
+}
+
+static bool apply_display_mode_value(const char *mode)
+{
+    char normalized[8];
+    if (!normalize_display_mode(mode, normalized, sizeof(normalized))) {
+        return false;
+    }
+    strlcpy(s_display_mode, normalized, sizeof(s_display_mode));
+    ESP_LOGI(TAG, "[DISPLAY] mode from command=%s", s_display_mode);
+    return true;
+}
+
+static bool apply_screensaver_json(cJSON *root)
+{
+    if (!root) {
+        return false;
+    }
+    bool updated = false;
+    bool found = false;
+    int int_value = json_get_int_alias(root, "theme", NULL, &found);
+    if (found && (int_value == 0 || int_value == 1)) {
+        s_screensaver_theme = int_value;
+        updated = true;
+    }
+    int_value = json_get_int_alias(root, "timeout_ms", "timeout", &found);
+    if (!found) int_value = json_get_int_alias(root, "timeoutMs", "timeoutMS", &found);
+    if (found && (int_value == 0 || int_value >= 5000)) {
+        s_screensaver_timeout_ms = int_value == 0 ? INT32_MAX : int_value;
+        updated = true;
+    }
+    int_value = json_get_int_alias(root, "time_size", "timeSize", &found);
+    if (found) {
+        s_screensaver_time_size = int_value;
+        updated = true;
+    }
+    int_value = json_get_int_alias(root, "date_size", "dateSize", &found);
+    if (found) {
+        s_screensaver_date_size = int_value;
+        updated = true;
+    }
+    int_value = json_get_int_alias(root, "time_color", "timeColor", &found);
+    if (found) {
+        s_screensaver_time_color = int_value;
+        updated = true;
+    } else {
+        cJSON *color = cJSON_GetObjectItem(root, "timeColor");
+        if (cJSON_IsString(color) && parse_rgb565_string(color->valuestring, &int_value)) {
+            s_screensaver_time_color = int_value;
+            updated = true;
+        }
+    }
+    int_value = json_get_int_alias(root, "date_color", "dateColor", &found);
+    if (found) {
+        s_screensaver_date_color = int_value;
+        updated = true;
+    } else {
+        cJSON *color = cJSON_GetObjectItem(root, "dateColor");
+        if (cJSON_IsString(color) && parse_rgb565_string(color->valuestring, &int_value)) {
+            s_screensaver_date_color = int_value;
+            updated = true;
+        }
+    }
+    if (updated) {
+        save_screensaver_settings();
+        ESP_LOGI(TAG, "[SCREENSAVER] settings applied theme=%d timeout=%d time_size=%d date_size=%d time_color=%d date_color=%d",
+                 s_screensaver_theme, s_screensaver_timeout_ms,
+                 s_screensaver_time_size, s_screensaver_date_size,
+                 s_screensaver_time_color, s_screensaver_date_color);
+    }
+    return updated;
+}
+
+static void business_ws_message_handler(const char *type, cJSON *root)
+{
+    if (!type) {
+        return;
+    }
+    ESP_LOGI(TAG, "[BWS] command type=%s", type);
+    if (strcmp(type, "__connected") == 0) {
+        send_business_ws_systeminfo();
+        return;
+    }
+    if (strcmp(type, "volume") == 0 || strcmp(type, "set_volume") == 0) {
+        cJSON *item = root ? cJSON_GetObjectItem(root, "data") : NULL;
+        if (!cJSON_IsNumber(item)) item = root ? cJSON_GetObjectItem(root, "volume_float") : NULL;
+        if (!cJSON_IsNumber(item)) item = root ? cJSON_GetObjectItem(root, "value") : NULL;
+        if (cJSON_IsNumber(item)) {
+            float volume = (float)item->valuedouble;
+            if (volume > 1.0f) volume /= 21.0f;
+            set_volume_and_persist(volume, "business_ws", false);
+        }
+        return;
+    }
+    if (strcmp(type, "add_volume") == 0 || strcmp(type, "subtract_volume") == 0) {
+        float delta = strcmp(type, "add_volume") == 0 ? (1.0f / 21.0f) : -(1.0f / 21.0f);
+        set_volume_and_persist(esp_ai_get_volume() + delta, type, true);
+        return;
+    }
+    if (strcmp(type, "wakeup") == 0) {
+        notify_activity("business_ws_wakeup");
+        otakulink_system_pause_business_ws_for_ai("business_ws_wakeup");
+        esp_ai_wakeup();
+        return;
+    }
+    if (strcmp(type, "tts") == 0 || strcmp(type, "char_text") == 0) {
+        cJSON *item = root ? cJSON_GetObjectItem(root, "data") : NULL;
+        if (!cJSON_IsString(item)) item = root ? cJSON_GetObjectItem(root, "text") : NULL;
+        if (cJSON_IsString(item)) {
+            notify_activity("business_ws_tts");
+            otakulink_system_pause_business_ws_for_ai("business_ws_tts");
+            esp_ai_tts(item->valuestring);
+        }
+        return;
+    }
+    if (strcmp(type, "voice_config") == 0 || strcmp(type, "getVoiceConfig") == 0) {
+        cJSON *data = root ? cJSON_GetObjectItem(root, "data") : NULL;
+        if (!cJSON_IsObject(data)) data = root;
+        bool updated = false;
+        if (copy_json_string(data, "personaId", s_persona_id, sizeof(s_persona_id)) ||
+            copy_json_string(data, "persona_id", s_persona_id, sizeof(s_persona_id)) ||
+            copy_json_string(data, "ext3", s_persona_id, sizeof(s_persona_id))) {
+            esp_ai_nvs_save("personaId", s_persona_id);
+            esp_ai_nvs_save("ext3", s_persona_id);
+            updated = true;
+        }
+        if (copy_json_string(data, "voiceId", s_voice_id, sizeof(s_voice_id)) ||
+            copy_json_string(data, "voice", s_voice_id, sizeof(s_voice_id))) {
+            esp_ai_nvs_save("voiceId", s_voice_id);
+            esp_ai_nvs_save("voice", s_voice_id);
+            updated = true;
+        }
+        if (copy_json_string(data, "personality", s_personality, sizeof(s_personality)) ||
+            copy_json_string(data, "persona", s_personality, sizeof(s_personality))) {
+            esp_ai_nvs_save("personality", s_personality);
+            esp_ai_nvs_save("persona", s_personality);
+            updated = true;
+        }
+        if (updated) {
+            s_ai_cfg.server.voice = s_voice_id;
+            s_ai_cfg.server.persona = s_persona_id;
+            refresh_business_ws_config("business_ws_voice_config");
+        }
+        return;
+    }
+    if (strcmp(type, "screensaver_settings") == 0 || strcmp(type, "screensaver") == 0) {
+        cJSON *data = root ? cJSON_GetObjectItem(root, "data") : NULL;
+        if (!cJSON_IsObject(data)) data = root;
+        apply_screensaver_json(data);
+        return;
+    }
+    if (strcmp(type, "display_mode") == 0) {
+        cJSON *item = root ? cJSON_GetObjectItem(root, "data") : NULL;
+        if (!cJSON_IsString(item)) item = root ? cJSON_GetObjectItem(root, "mode") : NULL;
+        if (cJSON_IsString(item)) apply_display_mode_value(item->valuestring);
+        return;
+    }
+    ESP_LOGI(TAG, "[BWS] command only logged type=%s", type);
+}
+
+static void activation_prompt_task(void *arg)
+{
+    (void)arg;
+    vTaskDelay(pdMS_TO_TICKS(1500));
+    if (esp_ai_is_connected() && !esp_ai_get_busy()) {
+        otakulink_system_pause_business_ws_for_ai("activation_prompt");
+        esp_ai_tts("设备激活成功，现在可以和我聊天了哦。");
+    }
+    vTaskDelete(NULL);
+}
+
+static void schedule_activation_prompt_once(void)
+{
+    if (s_activation_announced) {
+        return;
+    }
+    s_activation_announced = true;
+    esp_ai_nvs_save("activated", "1");
+    xTaskCreate(activation_prompt_task, "activation_prompt", 4096, NULL, 4, NULL);
+}
+
+/* AI 收到服务器指令的回调 */
+void on_ai_command(const char* type, cJSON* data)
+{
+    if (strcmp(type, "on_llm_cb") == 0) {
+        if (cJSON_IsString(data)) {
+            ESP_LOGI(TAG, "🤖 AI 回复: %s", data->valuestring);
+            char_text_append(data->valuestring);
+        } else if (cJSON_IsObject(data)) {
+            cJSON *text = cJSON_GetObjectItem(data, "text");
+            if (cJSON_IsString(text)) {
+                ESP_LOGI(TAG, "🤖 AI 回复: %s", text->valuestring);
+                char_text_append(text->valuestring);
+            }
+        }
+    } else if (strcmp(type, "on_iat_cb") == 0) {
+        const char *text = NULL;
+        if (cJSON_IsString(data)) {
+            text = data->valuestring;
+        } else if (cJSON_IsObject(data)) {
+            cJSON *text_item = cJSON_GetObjectItem(data, "text");
+            if (cJSON_IsString(text_item)) {
+                text = text_item->valuestring;
+            }
+        }
+        if (text) {
+            ESP_LOGI(TAG, "[ASR] 语音识别结果: %s", text);
+            if (otakulink_reminder_try_create_from_text(text)) {
+                return;
+            }
+        }
+    } else if (strcmp(type, "cron_task") == 0) {
+        if (otakulink_reminder_handle_cron_task(data)) {
+            notify_activity("cron_task");
+        }
+    } else if (strcmp(type, "session_status") == 0) {
+        const char *status = NULL;
+        if (cJSON_IsString(data)) {
+            status = data->valuestring;
+        } else if (cJSON_IsObject(data)) {
+            cJSON *status_item = cJSON_GetObjectItem(data, "status");
+            if (cJSON_IsString(status_item)) {
+                status = status_item->valuestring;
+            }
+        }
+        if (status) {
+            ESP_LOGI(TAG, "session_status: %s", status);
+        }
+        if (status && (strcmp(status, "tts_real_end") == 0 ||
+                       strcmp(status, "end") == 0 ||
+                       strcmp(status, "session_end") == 0)) {
+            char_text_finish();
+        }
+    } else {
+        ESP_LOGI(TAG, "收到指令类型: %s", type);
+    }
+}
+
+/* AI 业务 Ready 回调 */
+void on_ai_ready(void)
+{
+    ESP_LOGI(TAG, "🎉 AI 业务握手成功！");
+    schedule_activation_prompt_once();
+}
+
+static void start_ai_if_needed(void)
+{
+    if (s_ai_started) {
+        return;
+    }
+    esp_ai_on_ready(on_ai_ready);
+    esp_ai_on_command(on_ai_command);
+    esp_err_t err = esp_ai_begin(&s_ai_cfg);
+    if (err == ESP_OK) {
+        s_ai_started = true;
+        refresh_business_ws_config("ai_started");
+        ESP_LOGI(TAG, "ESP-AI started after WiFi got IP");
+    } else {
+        ESP_LOGE(TAG, "ESP-AI start failed: %s", esp_err_to_name(err));
+    }
+}
+
+static void ai_start_task(void *arg)
+{
+    (void)arg;
+    start_ai_if_needed();
+    s_ai_start_pending = false;
+    vTaskDelete(NULL);
+}
+
+static void request_ai_start(void)
+{
+    if (s_ai_started || s_ai_start_pending) {
+        return;
+    }
+    s_ai_start_pending = true;
+    BaseType_t ok = xTaskCreate(ai_start_task, "ai_start", 4096, NULL, 5, NULL);
+    if (ok != pdPASS) {
+        s_ai_start_pending = false;
+        ESP_LOGE(TAG, "Failed to create ai_start task");
+    }
+}
+
+/* ---- PDQ-compatible BLE provisioning ---- */
+#define BLE_DEVICE_NAME "OtakuLink-EchoVer2.0"
+#define BLE_WIFI_LIST_MAX 15
+
+static const ble_uuid128_t s_ble_service_uuid =
+    BLE_UUID128_INIT(0x4b, 0x91, 0x31, 0xc3, 0xc9, 0xc5, 0xcc, 0x8f,
+                     0x9e, 0x45, 0xb5, 0x1f, 0x01, 0xc2, 0xaf, 0x4f);
+static const ble_uuid128_t s_ble_char_uuid =
+    BLE_UUID128_INIT(0xa8, 0x26, 0x91, 0x14, 0x73, 0x6e, 0x5a, 0xea,
+                     0xb7, 0x8f, 0x46, 0xe1, 0x3e, 0x48, 0xb5, 0xbe);
+
+static uint16_t s_ble_conn_handle = BLE_HS_CONN_HANDLE_NONE;
+static uint16_t s_ble_chr_handle;
+static uint8_t s_ble_own_addr_type;
+static bool s_ble_notify_enabled = false;
+static bool s_ble_started = false;
+
+static int ble_gap_event_cb(struct ble_gap_event *event, void *arg);
+static void ble_start_advertising(void);
+
+static void ble_send_text(const char *text)
+{
+    if (!text || s_ble_conn_handle == BLE_HS_CONN_HANDLE_NONE || !s_ble_notify_enabled) {
+        return;
+    }
+    struct os_mbuf *om = ble_hs_mbuf_from_flat(text, strlen(text));
+    if (!om) {
+        ESP_LOGW(TAG, "[BLE] notify alloc failed: %s", text);
+        return;
+    }
+    int rc = ble_gatts_notify_custom(s_ble_conn_handle, s_ble_chr_handle, om);
+    if (rc != 0) {
+        ESP_LOGW(TAG, "[BLE] notify failed rc=%d msg=%s", rc, text);
+    } else {
+        ESP_LOGI(TAG, "[BLE] notify: %s", text);
+    }
+}
+
+static bool ble_has_valid_wifi(char *ip_out, size_t ip_out_len)
+{
+    wifi_ap_record_t ap = {0};
+    esp_netif_ip_info_t ip_info = {0};
+    esp_netif_t *netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+    bool connected = esp_wifi_sta_get_ap_info(&ap) == ESP_OK &&
+                     netif && esp_netif_get_ip_info(netif, &ip_info) == ESP_OK &&
+                     ip_info.ip.addr != 0 && ip_info.gw.addr != 0;
+    char ip[16] = "0.0.0.0";
+    char gw[16] = "0.0.0.0";
+    esp_ip4addr_ntoa(&ip_info.ip, ip, sizeof(ip));
+    esp_ip4addr_ntoa(&ip_info.gw, gw, sizeof(gw));
+    ESP_LOGI(TAG, "[BLE] WiFi检查 ip=%s gw=%s rssi=%d -> %s",
+             ip, gw, connected ? ap.rssi : 0, connected ? "OK" : "NOT_CONNECTED");
+    if (connected && ip_out && ip_out_len > 0) {
+        strlcpy(ip_out, ip, ip_out_len);
+    }
+    return connected;
+}
+
+static void ble_send_wifi_list(char ssids[][33], int count)
+{
+    char msg[64];
+    snprintf(msg, sizeof(msg), "WIFI_START:%d", count);
+    ble_send_text(msg);
+    vTaskDelay(pdMS_TO_TICKS(50));
+
+    for (int i = 0; i < count; ++i) {
+        if (ssids[i][0] == '\0') continue;
+        char prefix[12];
+        snprintf(prefix, sizeof(prefix), "W%d:", i);
+        size_t prefix_len = strlen(prefix);
+        const char *ssid = ssids[i];
+        size_t ssid_len = strlen(ssid);
+        size_t pos = 0;
+        int chunk = 0;
+        while (pos < ssid_len) {
+            size_t room = 18 > prefix_len ? 18 - prefix_len : 8;
+            size_t n = ssid_len - pos;
+            if (n > room) n = room;
+            if (chunk == 0) {
+                snprintf(msg, sizeof(msg), "%s%.*s", prefix, (int)n, ssid + pos);
+            } else {
+                snprintf(msg, sizeof(msg), "W%d+%d:%.*s", i, chunk, (int)n, ssid + pos);
+            }
+            ble_send_text(msg);
+            pos += n;
+            chunk++;
+            vTaskDelay(pdMS_TO_TICKS(80));
+        }
+    }
+    ble_send_text("WIFI_END");
+    ESP_LOGI(TAG, "[BLE] Wi-Fi列表发送完成 count=%d", count);
+}
+
+static void ble_wifi_scan_task(void *arg)
+{
+    (void)arg;
+    ESP_LOGI(TAG, "[BLE] WiFi扫描任务开始");
+    wifi_scan_config_t scan_config = {0};
+    esp_err_t err = esp_wifi_scan_start(&scan_config, true);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "[BLE] WiFi扫描失败: %s", esp_err_to_name(err));
+        ble_send_text("NO_WIFI");
+        vTaskDelete(NULL);
+        return;
+    }
+
+    uint16_t ap_count = 0;
+    esp_wifi_scan_get_ap_num(&ap_count);
+    if (ap_count == 0) {
+        ble_send_text("NO_WIFI");
+        vTaskDelete(NULL);
+        return;
+    }
+
+    wifi_ap_record_t *records = calloc(ap_count, sizeof(wifi_ap_record_t));
+    if (!records) {
+        ble_send_text("WIFI_ERROR:内存不足");
+        vTaskDelete(NULL);
+        return;
+    }
+    uint16_t fetch_count = ap_count;
+    esp_wifi_scan_get_ap_records(&fetch_count, records);
+
+    char ssids[BLE_WIFI_LIST_MAX][33] = {0};
+    int selected = 0;
+    for (int i = 0; i < fetch_count && selected < BLE_WIFI_LIST_MAX; ++i) {
+        if (records[i].ssid[0] == '\0') continue;
+        bool duplicate = false;
+        for (int j = 0; j < selected; ++j) {
+            if (strncmp(ssids[j], (const char *)records[i].ssid, sizeof(ssids[j])) == 0) {
+                duplicate = true;
+                break;
+            }
+        }
+        if (!duplicate) {
+            strlcpy(ssids[selected], (const char *)records[i].ssid, sizeof(ssids[selected]));
+            ESP_LOGI(TAG, "[BLE] WiFi %d: %s rssi=%d", selected + 1, ssids[selected], records[i].rssi);
+            selected++;
+        }
+    }
+    free(records);
+
+    if (selected > 0) {
+        ble_send_wifi_list(ssids, selected);
+    } else {
+        ble_send_text("NO_WIFI");
+    }
+    ESP_LOGI(TAG, "[BLE] WiFi扫描任务结束");
+    vTaskDelete(NULL);
+}
+
+static void ble_wifi_connect_task(void *arg)
+{
+    char *payload = (char *)arg;
+    char *comma = strchr(payload, ',');
+    if (!comma) {
+        ble_send_text("WIFI_ERROR:格式错误");
+        free(payload);
+        vTaskDelete(NULL);
+        return;
+    }
+    *comma = '\0';
+    const char *ssid = payload;
+    const char *password = comma + 1;
+    ESP_LOGI(TAG, "[BLE] 正在连接WiFi: SSID=%s", ssid);
+    ble_send_text("WIFI_CONNECTING:已收到WiFi配置，正在连接...");
+
+    wifi_config_t wifi_config = {0};
+    strlcpy((char *)wifi_config.sta.ssid, ssid, sizeof(wifi_config.sta.ssid));
+    strlcpy((char *)wifi_config.sta.password, password, sizeof(wifi_config.sta.password));
+    wifi_config.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
+    esp_wifi_disconnect();
+    esp_wifi_set_config(WIFI_IF_STA, &wifi_config);
+    esp_wifi_connect();
+
+    bool connected = false;
+    char ip[16] = {0};
+    for (int i = 0; i < 60; ++i) {
+        if (ble_has_valid_wifi(ip, sizeof(ip))) {
+            connected = true;
+            break;
+        }
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
+
+    if (connected) {
+        strlcpy(s_wifi_ssid, ssid, sizeof(s_wifi_ssid));
+        strlcpy(s_wifi_password, password, sizeof(s_wifi_password));
+        esp_ai_nvs_save("wifi_name", s_wifi_ssid);
+        esp_ai_nvs_save("wifi_pwd", s_wifi_password);
+        char msg[64];
+        snprintf(msg, sizeof(msg), "IP:%s", ip);
+        ble_send_text(msg);
+        vTaskDelay(pdMS_TO_TICKS(300));
+        ble_send_text("WIFI_OK:连接成功");
+        start_webserver();
+        request_ai_start();
+    } else {
+        ble_send_text("WIFI_ERROR:连接超时，请检查WiFi账号密码");
+    }
+
+    free(payload);
+    vTaskDelete(NULL);
+}
+
+static void ble_handle_command(const char *cmd)
+{
+    ESP_LOGI(TAG, "[BLE] 收到数据: %s", cmd);
+    if (strcmp(cmd, "REQUEST_IP") == 0) {
+        char ip[16];
+        if (ble_has_valid_wifi(ip, sizeof(ip))) {
+            char msg[64];
+            snprintf(msg, sizeof(msg), "IP:%s", ip);
+            ESP_LOGI(TAG, "[BLE] REQUEST_IP -> 返回 %s", msg);
+            ble_send_text(msg);
+        } else {
+            ESP_LOGI(TAG, "[BLE] REQUEST_IP -> WIFI_STATUS:NOT_CONNECTED");
+            ble_send_text("WIFI_STATUS:NOT_CONNECTED");
+        }
+        return;
+    }
+    if (strcmp(cmd, "SCAN_WIFI") == 0) {
+        xTaskCreate(ble_wifi_scan_task, "ble_wifi_scan", 8192, NULL, 2, NULL);
+        return;
+    }
+    const char *payload = NULL;
+    if (strncmp(cmd, "WIFI:", 5) == 0) {
+        payload = cmd + 5;
+    } else if (strchr(cmd, ',')) {
+        payload = cmd;
+    }
+    if (payload) {
+        char *copy = strdup(payload);
+        if (!copy) {
+            ble_send_text("WIFI_ERROR:内存不足");
+            return;
+        }
+        xTaskCreate(ble_wifi_connect_task, "ble_wifi_conn", 8192, copy, 2, NULL);
+        return;
+    }
+}
+
+static int ble_gatt_access_cb(uint16_t conn_handle, uint16_t attr_handle,
+                              struct ble_gatt_access_ctxt *ctxt, void *arg)
+{
+    (void)conn_handle;
+    (void)attr_handle;
+    (void)arg;
+    if (ctxt->op == BLE_GATT_ACCESS_OP_READ_CHR) {
+        const char *ready = "Ready for WiFi config";
+        return os_mbuf_append(ctxt->om, ready, strlen(ready)) == 0 ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
+    }
+    if (ctxt->op == BLE_GATT_ACCESS_OP_WRITE_CHR) {
+        uint16_t len = OS_MBUF_PKTLEN(ctxt->om);
+        if (len == 0) return 0;
+        if (len > 255) len = 255;
+        char buf[256];
+        int rc = ble_hs_mbuf_to_flat(ctxt->om, buf, len, NULL);
+        if (rc != 0) return BLE_ATT_ERR_UNLIKELY;
+        buf[len] = '\0';
+        ble_handle_command(buf);
+        return 0;
+    }
+    return BLE_ATT_ERR_UNLIKELY;
+}
+
+static const struct ble_gatt_svc_def s_ble_services[] = {
+    {
+        .type = BLE_GATT_SVC_TYPE_PRIMARY,
+        .uuid = &s_ble_service_uuid.u,
+        .characteristics = (struct ble_gatt_chr_def[]) {
+            {
+                .uuid = &s_ble_char_uuid.u,
+                .access_cb = ble_gatt_access_cb,
+                .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_NOTIFY,
+                .val_handle = &s_ble_chr_handle,
+            },
+            {0},
+        },
+    },
+    {0},
+};
+
+static int ble_gap_event_cb(struct ble_gap_event *event, void *arg)
+{
+    (void)arg;
+    switch (event->type) {
+    case BLE_GAP_EVENT_CONNECT:
+        if (event->connect.status == 0) {
+            s_ble_conn_handle = event->connect.conn_handle;
+            ESP_LOGI(TAG, "[BLE] connected handle=%d", s_ble_conn_handle);
+        } else {
+            ESP_LOGW(TAG, "[BLE] connect failed status=%d", event->connect.status);
+            ble_start_advertising();
+        }
+        return 0;
+    case BLE_GAP_EVENT_DISCONNECT:
+        ESP_LOGI(TAG, "[BLE] disconnected reason=%d", event->disconnect.reason);
+        s_ble_conn_handle = BLE_HS_CONN_HANDLE_NONE;
+        s_ble_notify_enabled = false;
+        ble_start_advertising();
+        return 0;
+    case BLE_GAP_EVENT_SUBSCRIBE:
+        if (event->subscribe.attr_handle == s_ble_chr_handle) {
+            s_ble_notify_enabled = event->subscribe.cur_notify;
+            ESP_LOGI(TAG, "[BLE] notify=%d", s_ble_notify_enabled ? 1 : 0);
+            if (s_ble_notify_enabled) {
+                ble_send_text("BLE_CONNECTED:ESP32已准备就绪，请发送REQUEST_IP获取IP地址");
+            }
+        }
+        return 0;
+    case BLE_GAP_EVENT_ADV_COMPLETE:
+        ble_start_advertising();
+        return 0;
+    default:
+        return 0;
+    }
+}
+
+static void ble_start_advertising(void)
+{
+    struct ble_hs_adv_fields fields;
+    memset(&fields, 0, sizeof(fields));
+    fields.flags = BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP;
+    fields.uuids128 = &s_ble_service_uuid;
+    fields.num_uuids128 = 1;
+    fields.uuids128_is_complete = 1;
+    int rc = ble_gap_adv_set_fields(&fields);
+    if (rc != 0) {
+        ESP_LOGE(TAG, "[BLE] adv fields failed rc=%d", rc);
+        return;
+    }
+
+    struct ble_hs_adv_fields rsp_fields;
+    memset(&rsp_fields, 0, sizeof(rsp_fields));
+    rsp_fields.name = (uint8_t *)BLE_DEVICE_NAME;
+    rsp_fields.name_len = strlen(BLE_DEVICE_NAME);
+    rsp_fields.name_is_complete = 1;
+    rc = ble_gap_adv_rsp_set_fields(&rsp_fields);
+    if (rc != 0) {
+        ESP_LOGE(TAG, "[BLE] adv response fields failed rc=%d", rc);
+        return;
+    }
+
+    struct ble_gap_adv_params adv_params;
+    memset(&adv_params, 0, sizeof(adv_params));
+    adv_params.conn_mode = BLE_GAP_CONN_MODE_UND;
+    adv_params.disc_mode = BLE_GAP_DISC_MODE_GEN;
+    rc = ble_gap_adv_start(s_ble_own_addr_type, NULL, BLE_HS_FOREVER, &adv_params, ble_gap_event_cb, NULL);
+    if (rc != 0) {
+        ESP_LOGE(TAG, "[BLE] adv start failed rc=%d", rc);
+    } else {
+        ESP_LOGI(TAG, "[BLE] advertising as %s addr_type=%u", BLE_DEVICE_NAME, s_ble_own_addr_type);
+    }
+}
+
+static void ble_on_sync(void)
+{
+    int rc = ble_hs_id_infer_auto(0, &s_ble_own_addr_type);
+    if (rc != 0) {
+        ESP_LOGE(TAG, "[BLE] infer addr type failed rc=%d", rc);
+        return;
+    }
+    ble_start_advertising();
+}
+
+static void ble_on_reset(int reason)
+{
+    ESP_LOGE(TAG, "[BLE] reset reason=%d", reason);
+}
+
+static void ble_host_task(void *param)
+{
+    (void)param;
+    nimble_port_run();
+    nimble_port_freertos_deinit();
+}
+
+static void ble_start_service(void)
+{
+    if (s_ble_started) return;
+    s_ble_started = true;
+
+    esp_err_t err = nimble_port_init();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "[BLE] nimble init failed: %s", esp_err_to_name(err));
+        return;
+    }
+    ble_hs_cfg.reset_cb = ble_on_reset;
+    ble_hs_cfg.sync_cb = ble_on_sync;
+    ble_hs_cfg.store_status_cb = ble_store_util_status_rr;
+
+    ble_svc_gap_init();
+    ble_svc_gatt_init();
+    int rc = ble_svc_gap_device_name_set(BLE_DEVICE_NAME);
+    if (rc != 0) ESP_LOGW(TAG, "[BLE] set name rc=%d", rc);
+    rc = ble_gatts_count_cfg(s_ble_services);
+    if (rc != 0) ESP_LOGE(TAG, "[BLE] count cfg rc=%d", rc);
+    rc = ble_gatts_add_svcs(s_ble_services);
+    if (rc != 0) ESP_LOGE(TAG, "[BLE] add svcs rc=%d", rc);
+    ble_store_config_init();
+    nimble_port_freertos_init(ble_host_task);
+    ESP_LOGI(TAG, "[BLE] BLE 初始化完成，开始广播");
+}
+
+/* GET /status 处理程序 */
+esp_err_t status_get_handler(httpd_req_t *req)
+{
+    char resp_str[512];
+    uint32_t free_sram = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+    uint32_t free_psram = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+    uint32_t min_free = esp_get_minimum_free_heap_size();
+
+    snprintf(resp_str, sizeof(resp_str),
+             "{\"status\":\"ok\", \"free_sram\":%lu, \"free_psram\":%lu, \"min_free\":%lu}",
+             (unsigned long)free_sram, (unsigned long)free_psram, (unsigned long)min_free);
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    httpd_resp_send(req, resp_str, strlen(resp_str));
+    return ESP_OK;
+}
+
+static void set_cors_headers(httpd_req_t *req)
+{
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Headers", "Content-Type");
+}
+
+static esp_err_t options_handler(httpd_req_t *req)
+{
+    set_cors_headers(req);
+    httpd_resp_send(req, "", 0);
+    return ESP_OK;
+}
+
+static esp_err_t read_request_body(httpd_req_t *req, char *buf, size_t buf_len)
+{
+    if (buf_len == 0) return ESP_ERR_INVALID_ARG;
+    size_t to_read = req->content_len;
+    if (to_read >= buf_len) {
+        to_read = buf_len - 1;
+    }
+
+    size_t offset = 0;
+    while (offset < to_read) {
+        int ret = httpd_req_recv(req, buf + offset, to_read - offset);
+        if (ret <= 0) {
+            if (ret == HTTPD_SOCK_ERR_TIMEOUT) {
+                continue;
+            }
+            return ESP_FAIL;
+        }
+        offset += (size_t)ret;
+    }
+    buf[offset] = '\0';
+    return ESP_OK;
+}
+
+static bool get_query_value(httpd_req_t *req, const char *key, char *out, size_t out_len)
+{
+    char query[256];
+    if (httpd_req_get_url_query_str(req, query, sizeof(query)) != ESP_OK) {
+        return false;
+    }
+    return httpd_query_key_value(query, key, out, out_len) == ESP_OK;
+}
+
+static char *read_request_body_alloc(httpd_req_t *req, size_t max_len)
+{
+    if (req->content_len == 0 || req->content_len > max_len) {
+        return NULL;
+    }
+    char *buf = heap_caps_malloc(req->content_len + 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!buf) {
+        buf = heap_caps_malloc(req->content_len + 1, MALLOC_CAP_8BIT);
+    }
+    if (!buf) {
+        return NULL;
+    }
+    size_t offset = 0;
+    while (offset < req->content_len) {
+        int ret = httpd_req_recv(req, buf + offset, req->content_len - offset);
+        if (ret <= 0) {
+            if (ret == HTTPD_SOCK_ERR_TIMEOUT) {
+                continue;
+            }
+            heap_caps_free(buf);
+            return NULL;
+        }
+        offset += (size_t)ret;
+    }
+    buf[offset] = '\0';
+    return buf;
+}
+
+static bool copy_json_string(cJSON *root, const char *key, char *out, size_t out_len)
+{
+    cJSON *item = cJSON_GetObjectItem(root, key);
+    if (!cJSON_IsString(item) || !item->valuestring || item->valuestring[0] == '\0') {
+        return false;
+    }
+    strlcpy(out, item->valuestring, out_len);
+    return true;
+}
+
+static bool copy_after_marker(const char *text, const char *marker, char *out, size_t out_len)
+{
+    const char *p = text ? strstr(text, marker) : NULL;
+    if (!p || !out || out_len == 0) {
+        return false;
+    }
+    p += strlen(marker);
+    size_t n = 0;
+    while (p[n] && p[n] != '"' && p[n] != '\\' && n + 1 < out_len) {
+        n++;
+    }
+    if (n == 0) {
+        return false;
+    }
+    memcpy(out, p, n);
+    out[n] = '\0';
+    return true;
+}
+
+static bool extract_agent_key_from_equipment_response(const char *body, char *out, size_t out_len)
+{
+    if (!body || !out || out_len == 0) {
+        return false;
+    }
+
+    const char *config = strstr(body, "\"config\"");
+    if (config) {
+        const char *iat = strstr(config, "\\\"iat_config\\\"");
+        if (iat && copy_after_marker(iat, "\\\"api_key\\\":\\\"", out, out_len)) {
+            return true;
+        }
+        const char *llm = strstr(config, "\\\"llm_config\\\"");
+        if (llm && copy_after_marker(llm, "\\\"api_key\\\":\\\"", out, out_len)) {
+            return true;
+        }
+    }
+
+    return copy_after_marker(body, "\"api_key\":\"", out, out_len) ||
+           copy_after_marker(body, "\\\"api_key\\\":\\\"", out, out_len);
+}
+
+typedef struct {
+    char *buf;
+    size_t cap;
+    size_t len;
+} http_collect_ctx_t;
+
+static esp_err_t collect_http_event(esp_http_client_event_t *evt)
+{
+    if (evt->event_id != HTTP_EVENT_ON_DATA || !evt->user_data || !evt->data || evt->data_len <= 0) {
+        return ESP_OK;
+    }
+    http_collect_ctx_t *ctx = (http_collect_ctx_t *)evt->user_data;
+    if (!ctx->buf || ctx->cap == 0 || ctx->len >= ctx->cap - 1) {
+        return ESP_OK;
+    }
+    size_t room = ctx->cap - 1 - ctx->len;
+    size_t copy_len = (size_t)evt->data_len;
+    if (copy_len > room) {
+        copy_len = room;
+    }
+    memcpy(ctx->buf + ctx->len, evt->data, copy_len);
+    ctx->len += copy_len;
+    ctx->buf[ctx->len] = '\0';
+    return ESP_OK;
+}
+
+static bool resolve_agent_key_from_user_key(const char *input_key, char *agent_key, size_t agent_key_len)
+{
+    if (!input_key || input_key[0] == '\0' || !agent_key || agent_key_len == 0) {
+        return false;
+    }
+
+    const size_t resp_cap = 32768;
+    char *response = heap_caps_malloc(resp_cap, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!response) {
+        response = heap_caps_malloc(resp_cap, MALLOC_CAP_8BIT);
+    }
+    if (!response) {
+        ESP_LOGW(TAG, "[APIKEY] no memory for equipment/list response");
+        return false;
+    }
+    response[0] = '\0';
+    http_collect_ctx_t collect = {
+        .buf = response,
+        .cap = resp_cap,
+        .len = 0,
+    };
+
+    esp_http_client_config_t cfg = {
+        .url = "http://api.espai2.fun/equipment/list",
+        .timeout_ms = 10000,
+        .buffer_size = 1024,
+        .buffer_size_tx = 512,
+        .event_handler = collect_http_event,
+        .user_data = &collect,
+    };
+    esp_http_client_handle_t client = esp_http_client_init(&cfg);
+    if (!client) {
+        heap_caps_free(response);
+        return false;
+    }
+
+    esp_http_client_set_method(client, HTTP_METHOD_POST);
+    esp_http_client_set_header(client, "Content-Type", "application/json");
+    esp_http_client_set_header(client, "authorization", input_key);
+    esp_http_client_set_post_field(client, "{}", 2);
+
+    esp_err_t err = esp_http_client_perform(client);
+    int status = esp_http_client_get_status_code(client);
+    esp_http_client_cleanup(client);
+
+    bool ok = false;
+    if (err == ESP_OK && status == 200) {
+        ok = extract_agent_key_from_equipment_response(response, agent_key, agent_key_len);
+        ESP_LOGI(TAG, "[APIKEY] equipment/list status=%d bytes=%u resolved=%d", status, (unsigned)collect.len, ok ? 1 : 0);
+    } else {
+        ESP_LOGW(TAG, "[APIKEY] equipment/list failed err=%s status=%d", esp_err_to_name(err), status);
+    }
+    heap_caps_free(response);
+    return ok;
+}
+
+static const uint8_t *find_bytes(const uint8_t *haystack, size_t haystack_len,
+                                 const char *needle, size_t needle_len)
+{
+    if (!haystack || !needle || needle_len == 0 || haystack_len < needle_len) {
+        return NULL;
+    }
+    for (size_t i = 0; i <= haystack_len - needle_len; ++i) {
+        if (memcmp(haystack + i, needle, needle_len) == 0) {
+            return haystack + i;
+        }
+    }
+    return NULL;
+}
+
+
+static const uint8_t *find_bytes_reverse(const uint8_t *haystack, size_t haystack_len,
+                                         const char *needle, size_t needle_len)
+{
+    if (!haystack || !needle || needle_len == 0 || haystack_len < needle_len) {
+        return NULL;
+    }
+    for (size_t pos = haystack_len - needle_len + 1; pos > 0; --pos) {
+        size_t i = pos - 1;
+        if (memcmp(haystack + i, needle, needle_len) == 0) {
+            return haystack + i;
+        }
+    }
+    return NULL;
+}
+
+static bool filename_has_ext(const char *filename, const char *ext)
+{
+    if (!filename || !ext) return false;
+    const char *dot = strrchr(filename, '.');
+    return dot && strcasecmp(dot, ext) == 0;
+}
+
+static const char *detect_upload_kind(const char *filename, const char *content_type)
+{
+    if (filename_has_ext(filename, ".png") || (content_type && strstr(content_type, "image/png"))) return "png";
+    if (filename_has_ext(filename, ".jpg") || filename_has_ext(filename, ".jpeg") ||
+        (content_type && strstr(content_type, "image/jpeg"))) return "jpg";
+    if (filename_has_ext(filename, ".bmp") || (content_type && strstr(content_type, "image/bmp"))) return "bmp";
+    if (filename_has_ext(filename, ".gif") || (content_type && strstr(content_type, "image/gif"))) return "gif";
+    return NULL;
+}
+
+static bool extract_quoted_value(const char *src, const char *key, char *out, size_t out_len)
+{
+    const char *p = strstr(src, key);
+    if (!p) return false;
+    p += strlen(key);
+    const char *end = strchr(p, '"');
+    if (!end || end <= p) return false;
+    size_t len = (size_t)(end - p);
+    if (len >= out_len) len = out_len - 1;
+    memcpy(out, p, len);
+    out[len] = '\0';
+    return true;
+}
+
+static void cleanup_static_uploads_except(const char *keep_path)
+{
+    const char *paths[] = {
+        "/sdcard/upload/photo.png",
+        "/sdcard/upload/photo.jpg",
+        "/sdcard/upload/photo.bmp",
+    };
+    for (size_t i = 0; i < sizeof(paths) / sizeof(paths[0]); ++i) {
+        if (strcmp(paths[i], keep_path) != 0) {
+            unlink(paths[i]);
+        }
+    }
+}
+
+static esp_err_t save_upload_file(const char *final_path, const uint8_t *data, size_t len)
+{
+    char tmp_path[128];
+    if (strstr(final_path, "/gif/")) {
+        strlcpy(tmp_path, "/sdcard/gif/TMP.BIN", sizeof(tmp_path));
+    } else {
+        strlcpy(tmp_path, "/sdcard/upload/TMP.BIN", sizeof(tmp_path));
+    }
+
+    const size_t chunk_size = 16 * 1024;
+    uint8_t *chunk = (uint8_t *)heap_caps_malloc(chunk_size, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT | MALLOC_CAP_DMA);
+    size_t actual_chunk = chunk_size;
+    if (!chunk) {
+        actual_chunk = 4 * 1024;
+        chunk = (uint8_t *)heap_caps_malloc(actual_chunk, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT | MALLOC_CAP_DMA);
+    }
+    if (!chunk) {
+        ESP_LOGE(TAG, "Upload no internal chunk buffer");
+        return ESP_ERR_NO_MEM;
+    }
+
+    unlink(tmp_path);
+    int fd = open(tmp_path, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+    if (fd < 0) {
+        ESP_LOGE(TAG, "Upload open failed: %s", tmp_path);
+        free(chunk);
+        return ESP_FAIL;
+    }
+
+    size_t written_total = 0;
+    int64_t write_started = esp_timer_get_time();
+    while (written_total < len) {
+        size_t n = len - written_total;
+        if (n > actual_chunk) n = actual_chunk;
+        memcpy(chunk, data + written_total, n);
+        ssize_t written = write(fd, chunk, n);
+        if (written <= 0 || (size_t)written != n) {
+            ESP_LOGE(TAG, "Upload write incomplete: %u/%u ret=%d", (unsigned)written_total, (unsigned)len, (int)written);
+            close(fd);
+            free(chunk);
+            unlink(tmp_path);
+            return ESP_FAIL;
+        }
+        written_total += n;
+    }
+    int64_t before_close = esp_timer_get_time();
+    close(fd);
+    free(chunk);
+
+    unlink(final_path);
+    int64_t before_rename = esp_timer_get_time();
+    if (rename(tmp_path, final_path) != 0) {
+        ESP_LOGE(TAG, "Upload rename failed: %s -> %s", tmp_path, final_path);
+        unlink(tmp_path);
+        return ESP_FAIL;
+    }
+    ESP_LOGI(TAG, "[UPLOAD] sd_write chunksz=%u write=%lldms close=%lldms rename=%lldms",
+             (unsigned)actual_chunk,
+             (long long)((before_close - write_started) / 1000),
+             (long long)((before_rename - before_close) / 1000),
+             (long long)((esp_timer_get_time() - before_rename) / 1000));
+    return ESP_OK;
+}
+
+static esp_err_t write_all_fd(int fd, const uint8_t *data, size_t len)
+{
+    size_t written_total = 0;
+    while (written_total < len) {
+        ssize_t written = write(fd, data + written_total, len - written_total);
+        if (written <= 0) {
+            return ESP_FAIL;
+        }
+        written_total += (size_t)written;
+    }
+    return ESP_OK;
+}
+
+static void build_upload_paths(const char *kind, char *final_path, size_t final_len,
+                               char *lv_src, size_t lv_len, char *tmp_path, size_t tmp_len)
+{
+    if (strcmp(kind, "gif") == 0) {
+        strlcpy(final_path, "/sdcard/gif/gif.gif", final_len);
+        strlcpy(lv_src, "S:/gif/gif.gif", lv_len);
+        strlcpy(tmp_path, "/sdcard/gif/TMP.BIN", tmp_len);
+    } else {
+        snprintf(final_path, final_len, "/sdcard/upload/photo.%s", kind);
+        snprintf(lv_src, lv_len, "S:/upload/photo.%s", kind);
+        strlcpy(tmp_path, "/sdcard/upload/TMP.BIN", tmp_len);
+    }
+}
+
+static esp_err_t finalize_upload_tmp_file(const char *tmp_path, const char *final_path,
+                                          int64_t write_started, int64_t *close_ms, int64_t *rename_ms)
+{
+    int64_t before_rename = esp_timer_get_time();
+    unlink(final_path);
+    if (rename(tmp_path, final_path) != 0) {
+        ESP_LOGE(TAG, "Upload rename failed: %s -> %s", tmp_path, final_path);
+        unlink(tmp_path);
+        return ESP_FAIL;
+    }
+    int64_t now = esp_timer_get_time();
+    if (close_ms) *close_ms = 0;
+    if (rename_ms) *rename_ms = (now - before_rename) / 1000;
+    (void)write_started;
+    return ESP_OK;
+}
+
+typedef struct {
+    int fd;
+    const char *marker;
+    size_t marker_len;
+    uint8_t *work;
+    size_t work_cap;
+    uint8_t tail[160];
+    size_t tail_len;
+    size_t file_len;
+    bool found_end;
+} upload_stream_state_t;
+
+static esp_err_t upload_stream_write_file_bytes(upload_stream_state_t *st, const uint8_t *data, size_t len)
+{
+    if (!st->work || st->tail_len + len > st->work_cap) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    memcpy(st->work, st->tail, st->tail_len);
+    memcpy(st->work + st->tail_len, data, len);
+    size_t work_len = st->tail_len + len;
+    st->tail_len = 0;
+
+    const uint8_t *end = find_bytes(st->work, work_len, st->marker, st->marker_len);
+    if (end) {
+        size_t write_len = (size_t)(end - st->work);
+        if (write_len > 0 && write_all_fd(st->fd, st->work, write_len) != ESP_OK) {
+            return ESP_FAIL;
+        }
+        st->file_len += write_len;
+        st->found_end = true;
+        return ESP_OK;
+    }
+
+    if (work_len > st->marker_len) {
+        size_t write_len = work_len - st->marker_len;
+        if (write_all_fd(st->fd, st->work, write_len) != ESP_OK) {
+            return ESP_FAIL;
+        }
+        st->file_len += write_len;
+        memcpy(st->tail, st->work + write_len, st->marker_len);
+        st->tail_len = st->marker_len;
+    } else if (work_len > 0) {
+        memcpy(st->tail, st->work, work_len);
+        st->tail_len = work_len;
+    }
+    return ESP_OK;
+}
+
+static esp_err_t drain_upload_remainder(httpd_req_t *req, uint8_t *rx, size_t rx_size, size_t *received)
+{
+    while (*received < req->content_len) {
+        size_t to_read = req->content_len - *received;
+        if (to_read > rx_size) to_read = rx_size;
+        int ret = httpd_req_recv(req, (char *)rx, to_read);
+        if (ret > 0) {
+            *received += (size_t)ret;
+            continue;
+        }
+        if (ret == HTTPD_SOCK_ERR_TIMEOUT) {
+            vTaskDelay(pdMS_TO_TICKS(5));
+            continue;
+        }
+        return ESP_FAIL;
+    }
+    return ESP_OK;
+}
+
+static esp_err_t stream_multipart_upload_to_sd(httpd_req_t *req,
+                                               const char *content_type,
+                                               int64_t started,
+                                               char *final_path,
+                                               size_t final_path_len,
+                                               char *lv_src,
+                                               size_t lv_src_len,
+                                               size_t *out_file_len,
+                                               const char **out_error,
+                                               int *out_status_code)
+{
+    const char *boundary_key = strstr(content_type, "boundary=");
+    if (!boundary_key) {
+        *out_status_code = 400;
+        *out_error = "NO_BOUNDARY";
+        return ESP_FAIL;
+    }
+
+    char boundary[96];
+    strlcpy(boundary, boundary_key + strlen("boundary="), sizeof(boundary));
+    char *semi = strchr(boundary, ';');
+    if (semi) *semi = '\0';
+    if (boundary[0] == '"') {
+        memmove(boundary, boundary + 1, strlen(boundary));
+        char *quote = strchr(boundary, '"');
+        if (quote) *quote = '\0';
+    }
+    if (boundary[0] == '\0') {
+        *out_status_code = 400;
+        *out_error = "NO_BOUNDARY";
+        return ESP_FAIL;
+    }
+
+    char marker[128];
+    snprintf(marker, sizeof(marker), "\r\n--%s", boundary);
+    size_t marker_len = strlen(marker);
+    if (marker_len >= 150) {
+        *out_status_code = 400;
+        *out_error = "BOUNDARY_TOO_LONG";
+        return ESP_FAIL;
+    }
+
+    const size_t rx_size = 8192;
+    uint8_t *rx = (uint8_t *)heap_caps_malloc(rx_size, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    uint8_t *work = (uint8_t *)heap_caps_malloc(rx_size + 160, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    uint8_t *header_buf = (uint8_t *)heap_caps_malloc(8192, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (!rx || !work || !header_buf) {
+        if (rx) heap_caps_free(rx);
+        if (work) heap_caps_free(work);
+        if (header_buf) heap_caps_free(header_buf);
+        *out_status_code = 500;
+        *out_error = "NO_MEMORY";
+        return ESP_FAIL;
+    }
+
+    mkdir("/sdcard/upload", 0775);
+    mkdir("/sdcard/gif", 0775);
+
+    size_t received = 0;
+    size_t header_used = 0;
+    int64_t last_data = started;
+    bool header_done = false;
+    char tmp_path[96] = {0};
+    int fd = -1;
+    upload_stream_state_t st = {
+        .fd = -1,
+        .marker = marker,
+        .marker_len = marker_len,
+        .work = work,
+        .work_cap = rx_size + 160,
+    };
+    int64_t write_started = 0;
+    int64_t before_close = 0;
+    esp_err_t result = ESP_FAIL;
+
+    while (received < req->content_len && !st.found_end) {
+        size_t to_read = req->content_len - received;
+        if (to_read > rx_size) to_read = rx_size;
+        int ret = httpd_req_recv(req, (char *)rx, to_read);
+        int64_t now = esp_timer_get_time();
+        if (ret <= 0) {
+            if (ret == HTTPD_SOCK_ERR_TIMEOUT) {
+                int64_t idle_ms = (now - last_data) / 1000;
+                int64_t total_ms = (now - started) / 1000;
+                if (idle_ms > 15000 || total_ms > 180000) {
+                    ESP_LOGW(TAG, "[UPLOAD] stream timeout offset=%u/%u idle=%lldms total=%lldms",
+                             (unsigned)received, (unsigned)req->content_len,
+                             (long long)idle_ms, (long long)total_ms);
+                    *out_status_code = 408;
+                    *out_error = "RECV_TIMEOUT";
+                    goto cleanup;
+                }
+                vTaskDelay(pdMS_TO_TICKS(10));
+                continue;
+            }
+            ESP_LOGW(TAG, "[UPLOAD] stream recv failed offset=%u/%u ret=%d",
+                     (unsigned)received, (unsigned)req->content_len, ret);
+            *out_status_code = 408;
+            *out_error = "RECV_FAILED";
+            goto cleanup;
+        }
+
+        received += (size_t)ret;
+        last_data = now;
+        if ((received % (128 * 1024)) < (size_t)ret || received == req->content_len) {
+            ESP_LOGI(TAG, "[UPLOAD] stream recv %u/%u file=%u elapsed=%lldms",
+                     (unsigned)received, (unsigned)req->content_len, (unsigned)st.file_len,
+                     (long long)((now - started) / 1000));
+        }
+
+        if (!header_done) {
+            if (header_used + (size_t)ret > 8192) {
+                *out_status_code = 400;
+                *out_error = "HEADER_TOO_LARGE";
+                goto cleanup;
+            }
+            memcpy(header_buf + header_used, rx, (size_t)ret);
+            header_used += (size_t)ret;
+            const uint8_t *header_end = find_bytes(header_buf, header_used, "\r\n\r\n", 4);
+            if (!header_end) {
+                continue;
+            }
+
+            size_t header_len = (size_t)(header_end - header_buf);
+            char *header = heap_caps_malloc(header_len + 1, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+            if (!header) {
+                *out_status_code = 500;
+                *out_error = "NO_MEMORY";
+                goto cleanup;
+            }
+            memcpy(header, header_buf, header_len);
+            header[header_len] = '\0';
+
+            char filename[96] = {0};
+            char part_type[96] = {0};
+            extract_quoted_value(header, "filename=\"", filename, sizeof(filename));
+            char *ct = strstr(header, "Content-Type:");
+            if (ct) {
+                ct += strlen("Content-Type:");
+                while (*ct == ' ') ct++;
+                char *line_end = strstr(ct, "\r\n");
+                size_t len = line_end ? (size_t)(line_end - ct) : strlen(ct);
+                if (len >= sizeof(part_type)) len = sizeof(part_type) - 1;
+                memcpy(part_type, ct, len);
+                part_type[len] = '\0';
+            }
+            heap_caps_free(header);
+
+            const char *kind = detect_upload_kind(filename, part_type);
+            if (!kind) {
+                *out_status_code = 415;
+                *out_error = "UNSUPPORTED_TYPE";
+                goto cleanup;
+            }
+            build_upload_paths(kind, final_path, final_path_len, lv_src, lv_src_len, tmp_path, sizeof(tmp_path));
+            unlink(tmp_path);
+            fd = open(tmp_path, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+            if (fd < 0) {
+                *out_status_code = 500;
+                *out_error = "SAVE_FAILED";
+                goto cleanup;
+            }
+            st.fd = fd;
+            write_started = esp_timer_get_time();
+            header_done = true;
+
+            size_t data_offset = (size_t)((header_end + 4) - header_buf);
+            size_t data_len = header_used - data_offset;
+            ESP_LOGI(TAG, "[UPLOAD] stream header=%u filename=%s type=%s final=%s",
+                     (unsigned)header_len, filename, part_type, final_path);
+            if (data_len > 0 && upload_stream_write_file_bytes(&st, header_buf + data_offset, data_len) != ESP_OK) {
+                *out_status_code = 500;
+                *out_error = "SAVE_FAILED";
+                goto cleanup;
+            }
+        } else {
+            if (upload_stream_write_file_bytes(&st, rx, (size_t)ret) != ESP_OK) {
+                *out_status_code = 500;
+                *out_error = "SAVE_FAILED";
+                goto cleanup;
+            }
+        }
+    }
+
+    if (!header_done || !st.found_end) {
+        *out_status_code = 400;
+        *out_error = "NO_MULTIPART_END";
+        goto cleanup;
+    }
+
+    if (received < req->content_len) {
+        drain_upload_remainder(req, rx, rx_size, &received);
+    }
+
+    before_close = esp_timer_get_time();
+    close(fd);
+    fd = -1;
+    int64_t after_close = esp_timer_get_time();
+    int64_t rename_ms = 0;
+    if (finalize_upload_tmp_file(tmp_path, final_path, write_started, NULL, &rename_ms) != ESP_OK) {
+        *out_status_code = 500;
+        *out_error = "SAVE_FAILED";
+        goto cleanup;
+    }
+
+    *out_file_len = st.file_len;
+    ESP_LOGI(TAG, "[UPLOAD] stream saved bytes=%u write=%lldms close=%lldms rename=%lldms elapsed=%lldms heap=%lu psram=%lu",
+             (unsigned)st.file_len,
+             (long long)((before_close - write_started) / 1000),
+             (long long)((after_close - before_close) / 1000),
+             (long long)rename_ms,
+             (long long)((esp_timer_get_time() - started) / 1000),
+             (unsigned long)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned long)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+    result = ESP_OK;
+
+cleanup:
+    if (fd >= 0) {
+        close(fd);
+    }
+    if (result != ESP_OK && tmp_path[0]) {
+        unlink(tmp_path);
+    }
+    heap_caps_free(rx);
+    heap_caps_free(work);
+    heap_caps_free(header_buf);
+    return result;
+}
+
+static esp_err_t api_status_get_handler(httpd_req_t *req)
+{
+    set_cors_headers(req);
+    char resp_str[1024];
+    otakulink_system_snapshot_t sys;
+    otakulink_system_get_snapshot(&sys);
+    bool ws_connected = esp_ai_is_connected();
+    bool busy = esp_ai_get_busy();
+
+    snprintf(resp_str, sizeof(resp_str),
+             "{\"success\":true,\"ws_connected\":%s,\"asr_ing\":false,"
+             "\"session_status\":\"%s\",\"session_id\":\"\",\"busy\":%s,"
+             "\"can_wakeup\":%s,\"free_sram\":%lu,\"free_psram\":%lu,"
+             "\"max_sram_block\":%lu,\"min_sram\":%lu,\"rssi\":%d,"
+             "\"business_ws_connected\":%s,\"business_ws_paused\":%s,"
+             "\"upload_active\":%s,\"network_recovery_active\":%s,"
+             "\"wifi_disconnects\":%lu,\"wifi_stack_resets\":%lu,"
+             "\"business_ws_connects\":%lu,\"business_ws_disconnects\":%lu,"
+             "\"business_ws_errors\":%lu,\"low_mem_events\":%lu}",
+             ws_connected ? "true" : "false",
+             busy ? "tts_chunk_start" : "idle",
+             busy ? "true" : "false",
+             (ws_connected && !busy) ? "true" : "false",
+             (unsigned long)sys.free_sram,
+             (unsigned long)sys.free_psram,
+             (unsigned long)sys.max_sram_block,
+             (unsigned long)sys.min_sram,
+             sys.rssi,
+             sys.business_ws_connected ? "true" : "false",
+             sys.business_ws_paused ? "true" : "false",
+             sys.upload_active ? "true" : "false",
+             sys.network_recovery_active ? "true" : "false",
+             (unsigned long)sys.wifi_disconnects,
+             (unsigned long)sys.wifi_stack_resets,
+             (unsigned long)sys.business_ws_connects,
+             (unsigned long)sys.business_ws_disconnects,
+             (unsigned long)sys.business_ws_errors,
+             (unsigned long)sys.low_mem_events);
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, resp_str, HTTPD_RESP_USE_STRLEN);
+    ESP_LOGI(TAG, "[HTTP] /api/status -> %s", resp_str);
+    return ESP_OK;
+}
+
+static esp_err_t get_voice_config_handler(httpd_req_t *req)
+{
+    set_cors_headers(req);
+    notify_activity("voice_config");
+
+    if (req->method == HTTP_POST) {
+        char *body = read_request_body_alloc(req, sizeof(s_personality) + sizeof(s_voice_id) + 256);
+        cJSON *root = body ? cJSON_Parse(body) : NULL;
+        if (!root) {
+            if (body) heap_caps_free(body);
+            httpd_resp_set_status(req, "400 Bad Request");
+            httpd_resp_set_type(req, "application/json");
+            httpd_resp_send(req, "{\"success\":false,\"error\":\"BAD_JSON\"}", HTTPD_RESP_USE_STRLEN);
+            return ESP_OK;
+        }
+
+        bool updated = false;
+        if (copy_json_string(root, "personaId", s_persona_id, sizeof(s_persona_id)) ||
+            copy_json_string(root, "persona_id", s_persona_id, sizeof(s_persona_id)) ||
+            copy_json_string(root, "ext3", s_persona_id, sizeof(s_persona_id))) {
+            esp_ai_nvs_save("personaId", s_persona_id);
+            esp_ai_nvs_save("ext3", s_persona_id);
+            updated = true;
+        }
+        if (copy_json_string(root, "voiceId", s_voice_id, sizeof(s_voice_id)) ||
+            copy_json_string(root, "voice", s_voice_id, sizeof(s_voice_id))) {
+            esp_ai_nvs_save("voiceId", s_voice_id);
+            esp_ai_nvs_save("voice", s_voice_id);
+            updated = true;
+        }
+        if (copy_json_string(root, "personality", s_personality, sizeof(s_personality)) ||
+            copy_json_string(root, "persona", s_personality, sizeof(s_personality))) {
+            esp_ai_nvs_save("personality", s_personality);
+            esp_ai_nvs_save("persona", s_personality);
+            updated = true;
+        }
+        s_ai_cfg.server.voice = s_voice_id;
+        s_ai_cfg.server.persona = s_persona_id;
+        if (updated) {
+            refresh_business_ws_config("http_voice_config");
+        }
+        cJSON_Delete(root);
+        heap_caps_free(body);
+
+        ESP_LOGI(TAG, "[HTTP] voice config saved updated=%d voice=%s persona_id=%s personality_len=%u",
+                 updated ? 1 : 0, s_voice_id, s_persona_id, (unsigned)strlen(s_personality));
+    }
+
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddBoolToObject(root, "success", true);
+    cJSON_AddStringToObject(root, "personaId", s_persona_id);
+    cJSON_AddStringToObject(root, "voiceId", s_voice_id);
+    cJSON_AddStringToObject(root, "personality", s_personality);
+    cJSON_AddNumberToObject(root, "timestamp", (double)esp_log_timestamp());
+    cJSON_AddStringToObject(root, "device_id", "98:A3:16:E3:F9:10");
+    char *json = cJSON_PrintUnformatted(root);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, json, HTTPD_RESP_USE_STRLEN);
+    ESP_LOGI(TAG, "[HTTP] /api/getVoiceConfig sent");
+    free(json);
+    cJSON_Delete(root);
+    return ESP_OK;
+}
+
+static esp_err_t volume_get_handler(httpd_req_t *req)
+{
+    set_cors_headers(req);
+    notify_activity("volume");
+    char value[24];
+    if (get_query_value(req, "value", value, sizeof(value))) {
+        float volume = strtof(value, NULL);
+        if (volume < 0.0f || volume > 1.0f) {
+            httpd_resp_set_status(req, "400 Bad Request");
+            httpd_resp_set_type(req, "application/json");
+            httpd_resp_send(req, "{\"success\":false,\"error\":\"VOLUME_OUT_OF_RANGE\"}", HTTPD_RESP_USE_STRLEN);
+            return ESP_OK;
+        }
+        set_volume_and_persist(volume, "http", true);
+    }
+
+    float volume = esp_ai_get_volume();
+    int display_volume = (int)(volume * 21.0f);
+    char resp[160];
+    snprintf(resp, sizeof(resp),
+             "{\"success\":true,\"volume\":%d,\"volume_float\":%.2f}",
+             display_volume, volume);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, resp, HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+static esp_err_t apikey_handler(httpd_req_t *req)
+{
+    set_cors_headers(req);
+    notify_activity("apikey");
+
+    if (req->method == HTTP_GET) {
+        bool has_key = s_api_key[0] != '\0';
+        char preview[32] = "";
+        size_t len = strlen(s_api_key);
+        if (has_key && len >= 8) {
+            snprintf(preview, sizeof(preview), "%.4s****%s", s_api_key, s_api_key + len - 4);
+        }
+        cJSON *root = cJSON_CreateObject();
+        cJSON_AddBoolToObject(root, "success", true);
+        cJSON_AddBoolToObject(root, "has_apikey", has_key);
+        if (preview[0]) cJSON_AddStringToObject(root, "apikey_preview", preview);
+        char *json = cJSON_PrintUnformatted(root);
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_send(req, json, HTTPD_RESP_USE_STRLEN);
+        free(json);
+        cJSON_Delete(root);
+        return ESP_OK;
+    }
+
+    char *body = read_request_body_alloc(req, 2048);
+    cJSON *root = body ? cJSON_Parse(body) : NULL;
+    char submitted_key[sizeof(s_api_key)] = {0};
+    if (root) {
+        copy_json_string(root, "apikey", submitted_key, sizeof(submitted_key));
+        if (submitted_key[0] == '\0') copy_json_string(root, "apiKey", submitted_key, sizeof(submitted_key));
+        if (submitted_key[0] == '\0') copy_json_string(root, "api_key", submitted_key, sizeof(submitted_key));
+    }
+
+    if (root) cJSON_Delete(root);
+    if (body) heap_caps_free(body);
+
+    if (submitted_key[0] == '\0') {
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_send(req, "{\"success\":false,\"error\":\"NO_APIKEY\"}", HTTPD_RESP_USE_STRLEN);
+        return ESP_OK;
+    }
+
+    char resolved_key[sizeof(s_api_key)] = {0};
+    bool resolved_from_user_key = resolve_agent_key_from_user_key(submitted_key, resolved_key, sizeof(resolved_key));
+    const char *key_to_save = resolved_from_user_key ? resolved_key : submitted_key;
+
+    strlcpy(s_api_key, key_to_save, sizeof(s_api_key));
+    strlcpy(s_ext1, key_to_save, sizeof(s_ext1));
+    if (resolved_from_user_key) {
+        strlcpy(s_user_api_key, submitted_key, sizeof(s_user_api_key));
+        esp_ai_nvs_save("user_api_key", s_user_api_key);
+    }
+    s_ai_cfg.server.api_key = s_api_key;
+    s_ai_cfg.server.ext1 = s_ext1;
+    esp_ai_nvs_save("api_key", s_api_key);
+    esp_ai_nvs_save("ext1", s_ext1);
+    ESP_LOGI(TAG, "[HTTP] API key saved, resolved_from_user=%d, scheduling restart", resolved_from_user_key ? 1 : 0);
+
+    httpd_resp_set_type(req, "application/json");
+    if (resolved_from_user_key) {
+        httpd_resp_send(req, "{\"success\":true,\"message\":\"用户Key已解析为智能体Key，设备将重启并初始化AI功能\",\"resolved\":true}", HTTPD_RESP_USE_STRLEN);
+    } else {
+        httpd_resp_send(req, "{\"success\":true,\"message\":\"API Key配置成功，设备将重启并初始化AI功能\",\"resolved\":false}", HTTPD_RESP_USE_STRLEN);
+    }
+    schedule_restart(1000);
+    return ESP_OK;
+}
+
+static bool normalize_display_mode(const char *in, char *out, size_t out_len)
+{
+    if (!in || !out || out_len < 4) return false;
+    if (strcmp(in, "0") == 0 || strcasecmp(in, "auto") == 0) {
+        strlcpy(out, "auto", out_len);
+        return true;
+    }
+    if (strcmp(in, "1") == 0 || strcasecmp(in, "gif") == 0) {
+        strlcpy(out, "gif", out_len);
+        return true;
+    }
+    if (strcmp(in, "2") == 0 || strcasecmp(in, "bmp") == 0 || strcasecmp(in, "image") == 0) {
+        strlcpy(out, "bmp", out_len);
+        return true;
+    }
+    return false;
+}
+
+static int json_get_int_alias(cJSON *root, const char *key1, const char *key2, bool *found)
+{
+    cJSON *item = key1 ? cJSON_GetObjectItem(root, key1) : NULL;
+    if ((!item || !cJSON_IsNumber(item)) && key2) {
+        item = cJSON_GetObjectItem(root, key2);
+    }
+    if (item && cJSON_IsNumber(item)) {
+        if (found) *found = true;
+        return item->valueint;
+    }
+    if (found) *found = false;
+    return 0;
+}
+
+static bool parse_rgb565_string(const char *s, int *out_color)
+{
+    if (!s || !out_color) {
+        return false;
+    }
+    while (*s == ' ' || *s == '#') {
+        s++;
+    }
+    if (s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) {
+        s += 2;
+    }
+    char *end = NULL;
+    uint32_t value = strtoul(s, &end, 16);
+    if (end == s) {
+        return false;
+    }
+    if (value <= 0xFFFF) {
+        *out_color = (int)value;
+    } else {
+        *out_color = (int)(((value >> 8) & 0xF800) | ((value >> 5) & 0x07E0) | ((value >> 3) & 0x001F));
+    }
+    return true;
+}
+
+static void save_screensaver_settings(void)
+{
+    char value[24];
+    snprintf(value, sizeof(value), "%d", s_screensaver_theme);
+    esp_ai_nvs_save("screensaver_theme", value);
+    snprintf(value, sizeof(value), "%d", s_screensaver_timeout_ms);
+    esp_ai_nvs_save("screensaver_timeout_ms", value);
+    snprintf(value, sizeof(value), "%d", s_screensaver_time_size);
+    esp_ai_nvs_save("screensaver_time_size", value);
+    snprintf(value, sizeof(value), "%d", s_screensaver_date_size);
+    esp_ai_nvs_save("screensaver_date_size", value);
+    snprintf(value, sizeof(value), "%d", s_screensaver_time_color);
+    esp_ai_nvs_save("screensaver_time_color", value);
+    snprintf(value, sizeof(value), "%d", s_screensaver_date_color);
+    esp_ai_nvs_save("screensaver_date_color", value);
+}
+
+static esp_err_t display_mode_handler(httpd_req_t *req)
+{
+    set_cors_headers(req);
+    notify_activity("display_mode");
+
+    if (req->method == HTTP_POST || req->method == HTTP_GET) {
+        char mode_arg[24];
+        if (get_query_value(req, "mode", mode_arg, sizeof(mode_arg))) {
+            if (!apply_display_mode_value(mode_arg)) {
+                httpd_resp_set_status(req, "400 Bad Request");
+                httpd_resp_send(req, "{\"success\":false,\"error\":\"BAD_MODE\"}", HTTPD_RESP_USE_STRLEN);
+                return ESP_OK;
+            }
+        } else if (req->method == HTTP_POST && req->content_len > 0) {
+            char body[128];
+            if (read_request_body(req, body, sizeof(body)) == ESP_OK) {
+                cJSON *root = cJSON_Parse(body);
+                cJSON *mode = root ? cJSON_GetObjectItem(root, "mode") : NULL;
+                if (cJSON_IsString(mode)) {
+                    apply_display_mode_value(mode->valuestring);
+                }
+                if (root) cJSON_Delete(root);
+            }
+        }
+    }
+
+    char resp[96];
+    snprintf(resp, sizeof(resp), "{\"success\":true,\"mode\":\"%s\"}", s_display_mode);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, resp, HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+static esp_err_t screensaver_settings_handler(httpd_req_t *req)
+{
+    set_cors_headers(req);
+    notify_activity("screensaver_settings");
+    bool updated = false;
+
+    if (req->method == HTTP_GET) {
+        char value[32];
+        if (get_query_value(req, "theme", value, sizeof(value))) {
+            int theme = atoi(value);
+            if (theme == 0 || theme == 1) {
+                s_screensaver_theme = theme;
+                updated = true;
+            }
+        }
+        if (get_query_value(req, "timeout_ms", value, sizeof(value))) {
+            int timeout = atoi(value);
+            if (timeout == 0 || timeout >= 5000) {
+                s_screensaver_timeout_ms = timeout == 0 ? INT32_MAX : timeout;
+                updated = true;
+            }
+        } else if (get_query_value(req, "timeout", value, sizeof(value))) {
+            int timeout_minutes = atoi(value);
+            if (timeout_minutes == 0) {
+                s_screensaver_timeout_ms = INT32_MAX;
+                updated = true;
+            } else if (timeout_minutes >= 1 && timeout_minutes <= 60) {
+                s_screensaver_timeout_ms = timeout_minutes * 60 * 1000;
+                updated = true;
+            }
+        }
+        if (get_query_value(req, "timeoutMs", value, sizeof(value)) || get_query_value(req, "timeoutMS", value, sizeof(value))) {
+            int timeout = atoi(value);
+            if (timeout == 0 || timeout >= 5000) {
+                s_screensaver_timeout_ms = timeout == 0 ? INT32_MAX : timeout;
+                updated = true;
+            }
+        }
+        if (get_query_value(req, "time_size", value, sizeof(value)) || get_query_value(req, "timeSize", value, sizeof(value))) {
+            s_screensaver_time_size = atoi(value);
+            updated = true;
+        }
+        if (get_query_value(req, "date_size", value, sizeof(value)) || get_query_value(req, "dateSize", value, sizeof(value))) {
+            s_screensaver_date_size = atoi(value);
+            updated = true;
+        }
+        if (get_query_value(req, "time_color", value, sizeof(value)) || get_query_value(req, "timeColor", value, sizeof(value))) {
+            int color_value = 0;
+            if (parse_rgb565_string(value, &color_value)) {
+                s_screensaver_time_color = color_value;
+                updated = true;
+            }
+        }
+        if (get_query_value(req, "date_color", value, sizeof(value)) || get_query_value(req, "dateColor", value, sizeof(value))) {
+            int color_value = 0;
+            if (parse_rgb565_string(value, &color_value)) {
+                s_screensaver_date_color = color_value;
+                updated = true;
+            }
+        }
+        if (updated) {
+            save_screensaver_settings();
+            ESP_LOGI(TAG, "[HTTP] screensaver GET settings saved theme=%d timeout=%d",
+                     s_screensaver_theme, s_screensaver_timeout_ms);
+        }
+    }
+
+    if (req->method == HTTP_POST && req->content_len > 0) {
+        char *body = read_request_body_alloc(req, 1024);
+        cJSON *root = body ? cJSON_Parse(body) : NULL;
+        if (!root) {
+            if (body) heap_caps_free(body);
+            httpd_resp_set_status(req, "400 Bad Request");
+            httpd_resp_set_type(req, "application/json");
+            httpd_resp_send(req, "{\"success\":false,\"error\":\"BAD_JSON\"}", HTTPD_RESP_USE_STRLEN);
+            return ESP_OK;
+        }
+
+        updated = apply_screensaver_json(root);
+
+        ESP_LOGI(TAG, "[HTTP] screensaver settings saved theme=%d timeout=%d",
+                 s_screensaver_theme, s_screensaver_timeout_ms);
+        cJSON_Delete(root);
+        heap_caps_free(body);
+    }
+
+    char resp[384];
+    snprintf(resp, sizeof(resp),
+             "{\"success\":true,\"theme\":%d,\"timeout_ms\":%d,\"timeoutMs\":%d,"
+             "\"timeSize\":%d,\"dateSize\":%d,\"timeColor\":%d,\"dateColor\":%d,"
+             "\"settings\":{\"theme\":%d,\"timeout_ms\":%d,"
+             "\"time_size\":%d,\"date_size\":%d,\"time_color\":%d,\"date_color\":%d}}",
+             s_screensaver_theme, s_screensaver_timeout_ms, s_screensaver_timeout_ms,
+             s_screensaver_time_size, s_screensaver_date_size,
+             s_screensaver_time_color, s_screensaver_date_color,
+             s_screensaver_theme, s_screensaver_timeout_ms,
+             s_screensaver_time_size, s_screensaver_date_size,
+             s_screensaver_time_color, s_screensaver_date_color);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, resp, HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+static esp_err_t screensaver_status_handler(httpd_req_t *req)
+{
+    set_cors_headers(req);
+    if (req->method == HTTP_POST) {
+        notify_activity("screensaver_status");
+    }
+
+    int64_t idle_ms = s_last_activity_us > 0 ? (esp_timer_get_time() - s_last_activity_us) / 1000 : 0;
+    char resp[192];
+    snprintf(resp, sizeof(resp),
+             "{\"success\":true,\"active\":%s,\"idle_ms\":%lld,\"timeout_ms\":%d,\"theme\":%d}",
+             s_screensaver_active ? "true" : "false",
+             (long long)idle_ms,
+             s_screensaver_timeout_ms,
+             s_screensaver_theme);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, resp, HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+static esp_err_t upload_post_handler(httpd_req_t *req)
+{
+    set_cors_headers(req);
+    notify_activity("upload");
+    esp_ai_set_upload_active(true);
+
+    int64_t started = esp_timer_get_time();
+    int64_t last_data = started;
+    size_t body_len = req->content_len;
+    uint8_t *body = NULL;
+    const uint8_t *file_data = NULL;
+    size_t file_len = 0;
+    char final_path[96] = {0};
+    char lv_src[96] = {0};
+    const char *kind = NULL;
+    bool should_show = false;
+    int status_code = 200;
+    const char *error = NULL;
+
+    ESP_LOGI(TAG, "[UPLOAD] start len=%u free_sram=%lu free_psram=%lu",
+             (unsigned)body_len,
+             (unsigned long)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned long)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+
+    if (body_len == 0 || body_len > 7 * 1024 * 1024) {
+        status_code = 400;
+        error = "BAD_SIZE";
+        goto done;
+    }
+
+    char content_type[160] = {0};
+    httpd_req_get_hdr_value_str(req, "Content-Type", content_type, sizeof(content_type));
+
+    const size_t stream_upload_threshold = 2 * 1024 * 1024;
+    if (strstr(content_type, "multipart/form-data") && body_len > stream_upload_threshold) {
+        ESP_LOGI(TAG, "[UPLOAD] using stream path threshold=%u", (unsigned)stream_upload_threshold);
+        esp_err_t stream_err = stream_multipart_upload_to_sd(req,
+                                                             content_type,
+                                                             started,
+                                                             final_path,
+                                                             sizeof(final_path),
+                                                             lv_src,
+                                                             sizeof(lv_src),
+                                                             &file_len,
+                                                             &error,
+                                                             &status_code);
+        if (stream_err != ESP_OK) {
+            goto done;
+        }
+        should_show = true;
+        if (should_show) {
+            cleanup_static_uploads_except(final_path);
+            request_show_uploaded_image(final_path, lv_src);
+        }
+        ESP_LOGI(TAG, "[UPLOAD] saved stream file=%s bytes=%u elapsed=%lldms",
+                 final_path, (unsigned)file_len, (long long)((esp_timer_get_time() - started) / 1000));
+        goto done;
+    }
+    if (strstr(content_type, "multipart/form-data")) {
+        ESP_LOGI(TAG, "[UPLOAD] using buffered path threshold=%u", (unsigned)stream_upload_threshold);
+    }
+
+    body = heap_caps_malloc(body_len + 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!body) {
+        body = heap_caps_malloc(body_len + 1, MALLOC_CAP_8BIT);
+    }
+    if (!body) {
+        status_code = 500;
+        error = "NO_MEMORY";
+        goto done;
+    }
+
+    size_t offset = 0;
+    while (offset < body_len) {
+        int ret = httpd_req_recv(req, (char *)body + offset, body_len - offset);
+        int64_t now = esp_timer_get_time();
+        if (ret > 0) {
+            offset += (size_t)ret;
+            last_data = now;
+            if ((offset % (128 * 1024)) < (size_t)ret || offset == body_len) {
+                ESP_LOGI(TAG, "[UPLOAD] recv progress %u/%u elapsed=%lldms",
+                         (unsigned)offset, (unsigned)body_len, (long long)((now - started) / 1000));
+            }
+            continue;
+        }
+
+        if (ret == HTTPD_SOCK_ERR_TIMEOUT) {
+            int64_t idle_ms = (now - last_data) / 1000;
+            int64_t total_ms = (now - started) / 1000;
+            if (idle_ms > 15000 || total_ms > 180000) {
+                ESP_LOGW(TAG, "[UPLOAD] recv timeout offset=%u/%u idle=%lldms total=%lldms",
+                         (unsigned)offset, (unsigned)body_len, (long long)idle_ms, (long long)total_ms);
+                status_code = 408;
+                error = "RECV_TIMEOUT";
+                goto done;
+            }
+            vTaskDelay(pdMS_TO_TICKS(10));
+            continue;
+        }
+
+        ESP_LOGW(TAG, "[UPLOAD] recv failed offset=%u/%u ret=%d", (unsigned)offset, (unsigned)body_len, ret);
+        status_code = 408;
+        error = "RECV_FAILED";
+        goto done;
+    }
+    body[body_len] = 0;
+
+    file_data = body;
+    file_len = body_len;
+    char filename[96] = {0};
+    char part_type[96] = {0};
+
+    if (strstr(content_type, "multipart/form-data")) {
+        const char *boundary_key = strstr(content_type, "boundary=");
+        if (!boundary_key) {
+            status_code = 400;
+            error = "NO_BOUNDARY";
+            goto done;
+        }
+        const char *boundary = boundary_key + strlen("boundary=");
+        char marker[96];
+        snprintf(marker, sizeof(marker), "\r\n--%s", boundary);
+
+        int64_t parse_started = esp_timer_get_time();
+        const uint8_t *header_end = find_bytes(body, body_len, "\r\n\r\n", 4);
+        if (!header_end) {
+            status_code = 400;
+            error = "BAD_MULTIPART";
+            goto done;
+        }
+
+        size_t header_len = (size_t)(header_end - body);
+        char *header = heap_caps_malloc(header_len + 1, MALLOC_CAP_8BIT);
+        if (!header) {
+            status_code = 500;
+            error = "NO_MEMORY";
+            goto done;
+        }
+        memcpy(header, body, header_len);
+        header[header_len] = '\0';
+        extract_quoted_value(header, "filename=\"", filename, sizeof(filename));
+        char *ct = strstr(header, "Content-Type:");
+        if (ct) {
+            ct += strlen("Content-Type:");
+            while (*ct == ' ') ct++;
+            char *line_end = strstr(ct, "\r\n");
+            size_t len = line_end ? (size_t)(line_end - ct) : strlen(ct);
+            if (len >= sizeof(part_type)) len = sizeof(part_type) - 1;
+            memcpy(part_type, ct, len);
+            part_type[len] = '\0';
+        }
+        heap_caps_free(header);
+
+        file_data = header_end + 4;
+        size_t remain = body_len - (size_t)(file_data - body);
+        const uint8_t *file_end = find_bytes_reverse(file_data, remain, marker, strlen(marker));
+        if (!file_end || file_end < file_data) {
+            status_code = 400;
+            error = "NO_MULTIPART_END";
+            goto done;
+        }
+        file_len = (size_t)(file_end - file_data);
+        ESP_LOGI(TAG, "[UPLOAD] multipart parsed header=%u file=%u dt=%lldms",
+                 (unsigned)header_len, (unsigned)file_len,
+                 (long long)((esp_timer_get_time() - parse_started) / 1000));
+    } else {
+        strlcpy(part_type, content_type, sizeof(part_type));
+        char name_arg[96];
+        if (get_query_value(req, "filename", name_arg, sizeof(name_arg))) {
+            strlcpy(filename, name_arg, sizeof(filename));
+        }
+    }
+
+    kind = detect_upload_kind(filename, part_type);
+    if (!kind) {
+        status_code = 415;
+        error = "UNSUPPORTED_TYPE";
+        goto done;
+    }
+
+    mkdir("/sdcard/upload", 0775);
+    mkdir("/sdcard/gif", 0775);
+
+    if (strcmp(kind, "gif") == 0) {
+        strlcpy(final_path, "/sdcard/gif/gif.gif", sizeof(final_path));
+        strlcpy(lv_src, "S:/gif/gif.gif", sizeof(lv_src));
+        should_show = true;
+    } else {
+        snprintf(final_path, sizeof(final_path), "/sdcard/upload/photo.%s", kind);
+        snprintf(lv_src, sizeof(lv_src), "S:/upload/photo.%s", kind);
+        should_show = true;
+    }
+
+    int64_t save_started = esp_timer_get_time();
+    esp_err_t save_err = save_upload_file(final_path, file_data, file_len);
+    ESP_LOGI(TAG, "[UPLOAD] save_file dt=%lldms file=%s bytes=%u",
+             (long long)((esp_timer_get_time() - save_started) / 1000), final_path, (unsigned)file_len);
+    if (save_err != ESP_OK) {
+        status_code = 500;
+        error = "SAVE_FAILED";
+        goto done;
+    }
+
+    if (should_show) {
+        cleanup_static_uploads_except(final_path);
+        request_show_uploaded_image(final_path, lv_src);
+    }
+
+    ESP_LOGI(TAG, "[UPLOAD] saved kind=%s file=%s bytes=%u elapsed=%lldms",
+             kind, final_path, (unsigned)file_len, (long long)((esp_timer_get_time() - started) / 1000));
+
+done:
+    if (body) {
+        heap_caps_free(body);
+    }
+    esp_ai_set_upload_active(false);
+
+    if (error) {
+        ESP_LOGW(TAG, "[UPLOAD] failed error=%s status=%d elapsed=%lldms",
+                 error, status_code, (long long)((esp_timer_get_time() - started) / 1000));
+        if (status_code == 400) httpd_resp_set_status(req, "400 Bad Request");
+        else if (status_code == 408) httpd_resp_set_status(req, "408 Request Timeout");
+        else if (status_code == 415) httpd_resp_set_status(req, "415 Unsupported Media Type");
+        else httpd_resp_set_status(req, "500 Internal Server Error");
+        httpd_resp_set_type(req, "application/json");
+        char resp[96];
+        snprintf(resp, sizeof(resp), "{\"success\":false,\"error\":\"%s\"}", error);
+        httpd_resp_send(req, resp, HTTPD_RESP_USE_STRLEN);
+        return ESP_OK;
+    }
+
+    char resp[192];
+    snprintf(resp, sizeof(resp),
+             "{\"success\":true,\"message\":\"Upload completed\",\"path\":\"%s\",\"size\":%u}",
+             final_path, (unsigned)file_len);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, resp, HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+/* GET /api/wakeup 处理程序 */
+esp_err_t wakeup_get_handler(httpd_req_t *req)
+{
+    ESP_LOGI(TAG, "收到 HTTP 唤醒请求");
+    set_cors_headers(req);
+    notify_activity("wakeup");
+    if (!esp_ai_is_connected()) {
+        httpd_resp_set_status(req, "503 Service Unavailable");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_send(req, "{\"status\":\"error\",\"error\":\"AI_NOT_CONNECTED\"}", HTTPD_RESP_USE_STRLEN);
+        return ESP_OK;
+    }
+    if (esp_ai_get_busy()) {
+        httpd_resp_set_status(req, "409 Conflict");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_send(req, "{\"status\":\"busy\",\"error\":\"AI_BUSY\"}", HTTPD_RESP_USE_STRLEN);
+        return ESP_OK;
+    }
+    otakulink_system_pause_business_ws_for_ai("http_wakeup");
+    esp_ai_wakeup();
+    const char* resp_str = "{\"status\":\"ok\", \"message\":\"waking up...\"}";
+    httpd_resp_send(req, resp_str, strlen(resp_str));
+    return ESP_OK;
+}
+
+
+static esp_err_t char_text_post_handler(httpd_req_t *req)
+{
+    set_cors_headers(req);
+    notify_activity("char_text");
+
+    if (!esp_ai_is_connected()) {
+        httpd_resp_set_status(req, "503 Service Unavailable");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_send(req, "{\"success\":false,\"error\":\"AI_NOT_CONNECTED\"}", HTTPD_RESP_USE_STRLEN);
+        return ESP_OK;
+    }
+
+    if (esp_ai_get_busy() || s_char_text_active) {
+        httpd_resp_set_status(req, "409 Conflict");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_send(req, "{\"success\":false,\"error\":\"AI_BUSY\"}", HTTPD_RESP_USE_STRLEN);
+        return ESP_OK;
+    }
+
+    char *body = read_request_body_alloc(req, 2048);
+    cJSON *root = body ? cJSON_Parse(body) : NULL;
+    cJSON *text_item = root ? cJSON_GetObjectItem(root, "text") : NULL;
+    const char *text = cJSON_IsString(text_item) ? text_item->valuestring : NULL;
+    if (!text || text[0] == '\0') {
+        if (root) cJSON_Delete(root);
+        if (body) heap_caps_free(body);
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_send(req, "{\"success\":false,\"error\":\"NO_TEXT\"}", HTTPD_RESP_USE_STRLEN);
+        return ESP_OK;
+    }
+
+    char text_copy[768];
+    strlcpy(text_copy, text, sizeof(text_copy));
+    if (root) cJSON_Delete(root);
+    if (body) heap_caps_free(body);
+
+    char_text_reset();
+    otakulink_system_pause_business_ws_for_ai("http_char_text");
+    esp_err_t send_err = esp_ai_tts(text_copy);
+    if (send_err != ESP_OK) {
+        char_text_set_inactive();
+        httpd_resp_set_status(req, "503 Service Unavailable");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_send(req, "{\"success\":false,\"error\":\"AI_SEND_FAILED\"}", HTTPD_RESP_USE_STRLEN);
+        return ESP_OK;
+    }
+
+    // Keep SSE send buffers internal: lwIP/httpd runs on internal-SRAM paths and
+    // previously hit an interrupt WDT while sending from PSRAM-backed buffers.
+    char *new_text = (char *)internal_text_alloc(1536);
+    char *escaped = (char *)internal_text_alloc(2048);
+    char *event = (char *)internal_text_alloc(2300);
+    if (!new_text || !escaped || !event) {
+        if (new_text) heap_caps_free(new_text);
+        if (escaped) heap_caps_free(escaped);
+        if (event) heap_caps_free(event);
+        char_text_set_inactive();
+        httpd_resp_set_status(req, "500 Internal Server Error");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_send(req, "{\"success\":false,\"error\":\"NO_MEMORY\"}", HTTPD_RESP_USE_STRLEN);
+        return ESP_OK;
+    }
+
+    ESP_LOGI(TAG, "[HTTP] /api/char_text start text_len=%u", (unsigned)strlen(text_copy));
+    httpd_resp_set_type(req, "text/event-stream");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-cache");
+    httpd_resp_set_hdr(req, "Connection", "keep-alive");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+
+    bool sent_any = false;
+    bool normal_done = false;
+    int64_t started = esp_timer_get_time();
+    int64_t last_event = started;
+    const int64_t first_token_timeout_ms = 30000;
+    const int64_t total_timeout_ms = 180000;
+
+    while (true) {
+        vTaskDelay(pdMS_TO_TICKS(20));
+        bool has_new = false;
+        bool done = false;
+        bool active = false;
+        size_t chunk_len = 0;
+        new_text[0] = '\0';
+
+        if (xSemaphoreTake(s_char_text_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+            has_new = s_char_text_has_new;
+            done = s_char_text_done;
+            active = s_char_text_active;
+            size_t accum_len = strlen(s_char_text_accum);
+            if (has_new && accum_len > s_char_text_last_pos) {
+                chunk_len = accum_len - s_char_text_last_pos;
+                if (chunk_len >= 1536) {
+                    chunk_len = 1535;
+                }
+                memcpy(new_text, s_char_text_accum + s_char_text_last_pos, chunk_len);
+                new_text[chunk_len] = '\0';
+                s_char_text_last_pos += chunk_len;
+                if (s_char_text_last_pos >= accum_len) {
+                    s_char_text_has_new = false;
+                }
+            }
+            xSemaphoreGive(s_char_text_mutex);
+        }
+
+        int64_t now = esp_timer_get_time();
+        if (!active) {
+            break;
+        }
+
+        if (chunk_len > 0) {
+            json_escape_text(new_text, escaped, 2048);
+            snprintf(event, 2300, "data: %s\n\n", escaped);
+            esp_err_t chunk_err = httpd_resp_send_chunk(req, event, HTTPD_RESP_USE_STRLEN);
+            if (chunk_err != ESP_OK) {
+                ESP_LOGW(TAG, "[HTTP] /api/char_text client disconnected while sending chunk err=%s", esp_err_to_name(chunk_err));
+                char_text_set_inactive();
+                heap_caps_free(new_text);
+                heap_caps_free(escaped);
+                heap_caps_free(event);
+                return ESP_OK;
+            }
+            sent_any = true;
+            last_event = now;
+            ESP_LOGI(TAG, "[HTTP] /api/char_text SSE chunk len=%u", (unsigned)chunk_len);
+        }
+
+        if (done) {
+            const char *round_end = "event: round_end\ndata: {\"done\":true}\n\n";
+            const char *end = "event: end\ndata: {\"done\":true}\n\n";
+            httpd_resp_send_chunk(req, round_end, HTTPD_RESP_USE_STRLEN);
+            httpd_resp_send_chunk(req, end, HTTPD_RESP_USE_STRLEN);
+            normal_done = true;
+            break;
+        }
+
+        int64_t elapsed_ms = (now - started) / 1000;
+        int64_t idle_ms = (now - last_event) / 1000;
+        if (sent_any && !esp_ai_get_busy() && idle_ms > 1200 && elapsed_ms > 2000) {
+            const char *round_end = "event: round_end\ndata: {\"done\":true}\n\n";
+            const char *end = "event: end\ndata: {\"done\":true}\n\n";
+            httpd_resp_send_chunk(req, round_end, HTTPD_RESP_USE_STRLEN);
+            httpd_resp_send_chunk(req, end, HTTPD_RESP_USE_STRLEN);
+            normal_done = true;
+            break;
+        }
+        if ((!sent_any && elapsed_ms > first_token_timeout_ms) || elapsed_ms > total_timeout_ms) {
+            ESP_LOGW(TAG, "[HTTP] /api/char_text timeout sent=%d elapsed=%lld idle=%lld",
+                     sent_any ? 1 : 0, (long long)elapsed_ms, (long long)idle_ms);
+            const char *timeout_event = "event: error\ndata: {\"error\":\"timeout\"}\n\n";
+            httpd_resp_send_chunk(req, timeout_event, HTTPD_RESP_USE_STRLEN);
+            break;
+        }
+    }
+
+    char_text_set_inactive();
+    httpd_resp_send_chunk(req, NULL, 0);
+    heap_caps_free(new_text);
+    heap_caps_free(escaped);
+    heap_caps_free(event);
+    ESP_LOGI(TAG, "[HTTP] /api/char_text end normal=%d sent=%d", normal_done ? 1 : 0, sent_any ? 1 : 0);
+    return ESP_OK;
+}
+
+/* POST /api/chat 处理程序 */
+esp_err_t chat_post_handler(httpd_req_t *req)
+{
+    set_cors_headers(req);
+    notify_activity("chat");
+    char buf[256];
+    if (read_request_body(req, buf, sizeof(buf)) != ESP_OK) return ESP_FAIL;
+
+    cJSON *root = cJSON_Parse(buf);
+    if (root) {
+        cJSON *text = cJSON_GetObjectItem(root, "text");
+        if (cJSON_IsString(text)) {
+            ESP_LOGI(TAG, "用户提问: %s", text->valuestring);
+            otakulink_system_pause_business_ws_for_ai("http_chat");
+            esp_err_t err = esp_ai_tts(text->valuestring);
+            if (err == ESP_OK) {
+                httpd_resp_set_type(req, "application/json");
+                httpd_resp_send(req, "{\"success\":true,\"status\":\"ok\"}", HTTPD_RESP_USE_STRLEN);
+            } else {
+                httpd_resp_set_status(req, "503 Service Unavailable");
+                httpd_resp_set_type(req, "application/json");
+                httpd_resp_send(req, "{\"success\":false,\"error\":\"AI_SEND_FAILED\"}", HTTPD_RESP_USE_STRLEN);
+            }
+        }
+        cJSON_Delete(root);
+    }
+    return ESP_OK;
+}
+
+static const httpd_uri_t status_uri = { .uri = "/status", .method = HTTP_GET, .handler = status_get_handler, .user_ctx = NULL };
+static const httpd_uri_t api_status_uri = { .uri = "/api/status", .method = HTTP_GET, .handler = api_status_get_handler, .user_ctx = NULL };
+static const httpd_uri_t voice_config_uri = { .uri = "/api/getVoiceConfig", .method = HTTP_GET, .handler = get_voice_config_handler, .user_ctx = NULL };
+static const httpd_uri_t voice_config_post_uri = { .uri = "/api/getVoiceConfig", .method = HTTP_POST, .handler = get_voice_config_handler, .user_ctx = NULL };
+static const httpd_uri_t volume_uri = { .uri = "/volume", .method = HTTP_GET, .handler = volume_get_handler, .user_ctx = NULL };
+static const httpd_uri_t api_volume_uri = { .uri = "/api/volume", .method = HTTP_GET, .handler = volume_get_handler, .user_ctx = NULL };
+static const httpd_uri_t display_mode_uri = { .uri = "/api/display/mode", .method = HTTP_GET, .handler = display_mode_handler, .user_ctx = NULL };
+static const httpd_uri_t display_mode_post_uri = { .uri = "/api/display/mode", .method = HTTP_POST, .handler = display_mode_handler, .user_ctx = NULL };
+static const httpd_uri_t display_mode_short_uri = { .uri = "/display/mode", .method = HTTP_GET, .handler = display_mode_handler, .user_ctx = NULL };
+static const httpd_uri_t display_mode_short_post_uri = { .uri = "/display/mode", .method = HTTP_POST, .handler = display_mode_handler, .user_ctx = NULL };
+static const httpd_uri_t screensaver_uri = { .uri = "/api/screensaver/settings", .method = HTTP_GET, .handler = screensaver_settings_handler, .user_ctx = NULL };
+static const httpd_uri_t screensaver_post_uri = { .uri = "/api/screensaver/settings", .method = HTTP_POST, .handler = screensaver_settings_handler, .user_ctx = NULL };
+static const httpd_uri_t screensaver_short_uri = { .uri = "/screensaver", .method = HTTP_GET, .handler = screensaver_settings_handler, .user_ctx = NULL };
+static const httpd_uri_t screensaver_short_post_uri = { .uri = "/screensaver", .method = HTTP_POST, .handler = screensaver_settings_handler, .user_ctx = NULL };
+static const httpd_uri_t screensaver_status_uri = { .uri = "/api/screensaver", .method = HTTP_GET, .handler = screensaver_status_handler, .user_ctx = NULL };
+static const httpd_uri_t screensaver_status_post_uri = { .uri = "/api/screensaver", .method = HTTP_POST, .handler = screensaver_status_handler, .user_ctx = NULL };
+static const httpd_uri_t wakeup_uri = { .uri = "/api/wakeup", .method = HTTP_GET, .handler = wakeup_get_handler, .user_ctx = NULL };
+static const httpd_uri_t wakeup_post_uri = { .uri = "/api/wakeup", .method = HTTP_POST, .handler = wakeup_get_handler, .user_ctx = NULL };
+static const httpd_uri_t chat_uri = { .uri = "/api/chat", .method = HTTP_POST, .handler = chat_post_handler, .user_ctx = NULL };
+static const httpd_uri_t char_text_uri = { .uri = "/api/char_text", .method = HTTP_POST, .handler = char_text_post_handler, .user_ctx = NULL };
+static const httpd_uri_t api_upload_uri = { .uri = "/api/upload", .method = HTTP_POST, .handler = upload_post_handler, .user_ctx = NULL };
+static const httpd_uri_t upload_uri = { .uri = "/upload", .method = HTTP_POST, .handler = upload_post_handler, .user_ctx = NULL };
+static const httpd_uri_t api_apikey_uri = { .uri = "/api/apikey", .method = HTTP_GET, .handler = apikey_handler, .user_ctx = NULL };
+static const httpd_uri_t api_apikey_post_uri = { .uri = "/api/apikey", .method = HTTP_POST, .handler = apikey_handler, .user_ctx = NULL };
+static const httpd_uri_t apikey_post_uri = { .uri = "/apikey", .method = HTTP_POST, .handler = apikey_handler, .user_ctx = NULL };
+static const httpd_uri_t api_config_apikey_post_uri = { .uri = "/api/config/apikey", .method = HTTP_POST, .handler = apikey_handler, .user_ctx = NULL };
+static const httpd_uri_t options_all_uri = { .uri = "/*", .method = HTTP_OPTIONS, .handler = options_handler, .user_ctx = NULL };
+
+static esp_err_t register_route(httpd_handle_t server, const httpd_uri_t *route)
+{
+    esp_err_t err = httpd_register_uri_handler(server, route);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "HTTP route register failed: uri=%s method=%d err=%s",
+                 route->uri, route->method, esp_err_to_name(err));
+    }
+    return err;
+}
+
+static httpd_handle_t start_webserver(void)
+{
+    static httpd_handle_t server = NULL;
+    if (server) {
+        ESP_LOGI(TAG, "HTTP server already started");
+        return server;
+    }
+
+    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+    config.max_uri_handlers = 36;
+    config.stack_size = 8192;
+    config.uri_match_fn = httpd_uri_match_wildcard;
+    if (httpd_start(&server, &config) == ESP_OK) {
+        register_route(server, &status_uri);
+        register_route(server, &api_status_uri);
+        register_route(server, &voice_config_uri);
+        register_route(server, &voice_config_post_uri);
+        register_route(server, &volume_uri);
+        register_route(server, &api_volume_uri);
+        register_route(server, &display_mode_uri);
+        register_route(server, &display_mode_post_uri);
+        register_route(server, &display_mode_short_uri);
+        register_route(server, &display_mode_short_post_uri);
+        register_route(server, &screensaver_uri);
+        register_route(server, &screensaver_post_uri);
+        register_route(server, &screensaver_short_uri);
+        register_route(server, &screensaver_short_post_uri);
+        register_route(server, &screensaver_status_uri);
+        register_route(server, &screensaver_status_post_uri);
+        register_route(server, &wakeup_uri);
+        register_route(server, &wakeup_post_uri);
+        register_route(server, &chat_uri);
+        register_route(server, &char_text_uri);
+        register_route(server, &api_upload_uri);
+        register_route(server, &upload_uri);
+        register_route(server, &api_apikey_uri);
+        register_route(server, &api_apikey_post_uri);
+        register_route(server, &apikey_post_uri);
+        register_route(server, &api_config_apikey_post_uri);
+        register_route(server, &options_all_uri);
+        ESP_LOGI(TAG, "HTTP server started");
+        return server;
+    }
+    server = NULL;
+    return NULL;
+}
+
+/* Wi-Fi 事件处理 */
+static void wifi_event_handler(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data)
+{
+    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
+        esp_wifi_connect();
+    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        ESP_LOGW(TAG, "WiFi disconnected, reconnecting...");
+        otakulink_system_on_wifi_disconnected();
+        esp_wifi_connect();
+    } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+        esp_netif_t *netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+        esp_netif_dns_info_t dns;
+        dns.ip.u_addr.ip4.addr = ipaddr_addr("114.114.114.114");
+        dns.ip.type = IPADDR_TYPE_V4;
+        esp_netif_set_dns_info(netif, ESP_NETIF_DNS_MAIN, &dns);
+        ESP_LOGI(TAG, "WiFi 已就绪，启动服务...");
+        otakulink_system_on_wifi_got_ip();
+        start_webserver();
+        request_ai_start();
+    }
+}
+
+void app_main(void)
+{
+    s_pending_show_mutex = xSemaphoreCreateMutex();
+    s_char_text_mutex = xSemaphoreCreateMutex();
+    otakulink_reminder_init();
+    notify_activity("boot");
+
+    nvs_flash_init();
+    load_runtime_config();
+    esp_netif_init();
+    esp_event_loop_create_default();
+    esp_netif_create_default_wifi_sta();
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    esp_wifi_init(&cfg);
+    otakulink_system_init();
+    otakulink_system_set_business_ws_message_cb(business_ws_message_handler);
+    esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL, NULL);
+    esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL, NULL);
+    wifi_config_t wifi_config = {0};
+    strlcpy((char *)wifi_config.sta.ssid, s_wifi_ssid, sizeof(wifi_config.sta.ssid));
+    strlcpy((char *)wifi_config.sta.password, s_wifi_password, sizeof(wifi_config.sta.password));
+    esp_wifi_set_mode(WIFI_MODE_STA);
+    esp_wifi_set_config(WIFI_IF_STA, &wifi_config);
+    esp_wifi_start();
+    ble_start_service();
+
+    // 初始化 SD 卡
+    if (esp_ai_sd_init() == ESP_OK) {
+        ESP_LOGI("MAIN", "SD Card initialized successfully!");
+        // 简单读取一下目录里的文件看看
+                DIR* dir = opendir("/sdcard");
+        if (dir != NULL) {
+            struct dirent* ent;
+            while ((ent = readdir(dir)) != NULL) {
+                ESP_LOGI("MAIN", "Found file: %s", ent->d_name);
+            }
+            closedir(dir);
+        }
+        
+        ESP_LOGI("MAIN", "--- Listing /sdcard/upload ---");
+        DIR* udir = opendir("/sdcard/upload");
+        if (udir != NULL) {
+            struct dirent* ent;
+            while ((ent = readdir(udir)) != NULL) {
+                ESP_LOGI("MAIN", "Upload file: %s", ent->d_name);
+            }
+            closedir(udir);
+        }
+    } else {
+        ESP_LOGE("MAIN", "Failed to initialize SD Card.");
+    }
+
+    // 1. 优先启动图形交互引擎 (给屏幕逻辑供电)
+    esp_ai_ui_init();
+
+    // 设置背景为黑色
+    lv_obj_set_style_bg_color(lv_scr_act(), lv_color_hex(0x000000), LV_PART_MAIN);
+
+    // 当前 IDF 版先走自定义 BMP 解码路径；JPG/PNG 不能直接交给 LVGL 显示。
+    struct stat st;
+    if (stat("/sdcard/upload/photo.bmp", &st) == 0) {
+        ESP_LOGI("MAIN", "Loading BMP image from SD: /sdcard/upload/photo.bmp size=%ld", (long)st.st_size);
+        esp_ai_ui_show_bmp_file("/sdcard/upload/photo.bmp");
+    } else if (stat("/sdcard/upload/photo.jpg", &st) == 0) {
+        ESP_LOGI("MAIN", "Loading JPG image from SD: /sdcard/upload/photo.jpg size=%ld", (long)st.st_size);
+        esp_ai_ui_show_jpeg_file("/sdcard/upload/photo.jpg");
+    } else if (stat("/sdcard/upload/photo.png", &st) == 0) {
+        ESP_LOGI("MAIN", "Loading PNG image from SD: /sdcard/upload/photo.png size=%ld", (long)st.st_size);
+        esp_ai_ui_show_png_file("/sdcard/upload/photo.png");
+    } else if (stat("/sdcard/01.BMP", &st) == 0) {
+        ESP_LOGI("MAIN", "Fallback to BMP: /sdcard/01.BMP size=%ld", (long)st.st_size);
+        esp_ai_ui_show_bmp_file("/sdcard/01.BMP");
+    } else {
+        ESP_LOGW("MAIN", "No supported boot image found on SD");
+    }
+
+    while(1) {
+        lv_tick_inc(10);
+        poll_screensaver_state();
+        otakulink_reminder_tick();
+        process_pending_image_show();
+        lv_timer_handler(); // 驱动 LVGL 计时器
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+}
