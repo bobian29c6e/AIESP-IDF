@@ -253,7 +253,7 @@ esp_err_t esp_ai_ui_init(void)
 esp_err_t esp_ai_ui_show_rgb565_buffer_take(void *buffer, int width, int height, const char *label)
 {
     if (!buffer || width != LCD_H_RES || height != LCD_V_RES) {
-        ESP_LOGE(TAG, "Invalid RGB565 buffer: ptr=%p size=%dx%d label=%s", buffer, width, height, label ? label : "<null>");
+        ESP_LOGE(TAG, "RGB565缓冲无效: ptr=%p 尺寸=%dx%d 标记=%s", buffer, width, height, label ? label : "<null>");
         return ESP_ERR_INVALID_ARG;
     }
 
@@ -272,7 +272,7 @@ esp_err_t esp_ai_ui_show_rgb565_buffer_take(void *buffer, int width, int height,
     s_image_dsc.data = (const uint8_t *)s_image_buf;
 
     if (s_image_obj && !lv_obj_is_valid(s_image_obj)) {
-        ESP_LOGW(TAG, "Drop stale image object before showing: %s", label ? label : "<buffer>");
+        ESP_LOGW(TAG, "显示前丢弃失效图片对象: %s", label ? label : "<buffer>");
         s_image_obj = NULL;
     }
     if (!s_image_obj) {
@@ -282,32 +282,32 @@ esp_err_t esp_ai_ui_show_rgb565_buffer_take(void *buffer, int width, int height,
     lv_obj_align(s_image_obj, LV_ALIGN_CENTER, 0, 0);
     lv_obj_move_foreground(s_image_obj);
 
-    ESP_LOGI(TAG, "RGB565 buffer shown: %s %dx%d", label ? label : "<buffer>", width, height);
+    ESP_LOGI(TAG, "RGB565缓冲显示完成: %s %dx%d", label ? label : "<buffer>", width, height);
     return ESP_OK;
 }
 
 esp_err_t esp_ai_ui_show_bmp_file(const char *path)
 {
     if (!path || path[0] == '\0') {
-        ESP_LOGE(TAG, "BMP path is empty");
+        ESP_LOGE(TAG, "BMP路径为空");
         return ESP_ERR_INVALID_ARG;
     }
 
     FILE *f = fopen(path, "rb");
     if (!f) {
-        ESP_LOGE(TAG, "Open BMP failed: %s", path);
+        ESP_LOGE(TAG, "打开BMP失败: %s", path);
         return ESP_FAIL;
     }
 
     uint8_t header[54];
     if (fread(header, 1, sizeof(header), f) != sizeof(header)) {
-        ESP_LOGE(TAG, "Read BMP header failed: %s", path);
+        ESP_LOGE(TAG, "读取BMP头失败: %s", path);
         fclose(f);
         return ESP_FAIL;
     }
 
     if (header[0] != 'B' || header[1] != 'M') {
-        ESP_LOGE(TAG, "Not a BMP file: %s", path);
+        ESP_LOGE(TAG, "不是BMP文件: %s", path);
         fclose(f);
         return ESP_ERR_INVALID_ARG;
     }
@@ -322,7 +322,7 @@ esp_err_t esp_ai_ui_show_bmp_file(const char *path)
 
     if (dib_size < 40 || planes != 1 || compression != 0 || src_w_signed == 0 || src_h_signed == 0 ||
         !(bpp == 16 || bpp == 24 || bpp == 32)) {
-        ESP_LOGE(TAG, "Unsupported BMP: %s dib=%lu planes=%u bpp=%u comp=%lu w=%ld h=%ld",
+        ESP_LOGE(TAG, "不支持的BMP: %s dib=%lu planes=%u bpp=%u 压缩=%lu 宽=%ld 高=%ld",
                  path, (unsigned long)dib_size, planes, bpp, (unsigned long)compression,
                  (long)src_w_signed, (long)src_h_signed);
         fclose(f);
@@ -342,7 +342,7 @@ esp_err_t esp_ai_ui_show_bmp_file(const char *path)
         row = heap_caps_malloc(row_size, MALLOC_CAP_8BIT);
     }
     if (!row) {
-        ESP_LOGE(TAG, "No memory for BMP row: row=%d path=%s", row_size, path);
+        ESP_LOGE(TAG, "BMP行缓冲内存不足: 行=%d 路径=%s", row_size, path);
         fclose(f);
         return ESP_ERR_NO_MEM;
     }
@@ -353,7 +353,7 @@ esp_err_t esp_ai_ui_show_bmp_file(const char *path)
         new_buf = heap_caps_malloc(screen_pixels * sizeof(lv_color_t), MALLOC_CAP_8BIT);
     }
     if (!new_buf) {
-        ESP_LOGE(TAG, "No memory for BMP screen buffer: %u bytes path=%s",
+        ESP_LOGE(TAG, "BMP屏幕缓冲内存不足: %u字节 路径=%s",
                  (unsigned)(screen_pixels * sizeof(lv_color_t)), path);
         free(row);
         fclose(f);
@@ -368,7 +368,7 @@ esp_err_t esp_ai_ui_show_bmp_file(const char *path)
         int src_y = bottom_up ? (src_h - 1 - y) : y;
         long pos = (long)pixel_offset + (long)src_y * row_size;
         if (fseek(f, pos, SEEK_SET) != 0 || fread(row, 1, row_size, f) != (size_t)row_size) {
-            ESP_LOGE(TAG, "Read BMP row failed: y=%d pos=%ld path=%s", y, pos, path);
+            ESP_LOGE(TAG, "读取BMP行失败: y=%d 位置=%ld 路径=%s", y, pos, path);
             free(new_buf);
             free(row);
             fclose(f);
@@ -413,7 +413,7 @@ esp_err_t esp_ai_ui_show_bmp_file(const char *path)
     s_image_dsc.data = (const uint8_t *)s_image_buf;
 
     if (s_image_obj && !lv_obj_is_valid(s_image_obj)) {
-        ESP_LOGW(TAG, "Drop stale image object before showing BMP: %s", path);
+        ESP_LOGW(TAG, "显示BMP前丢弃失效图片对象: %s", path);
         s_image_obj = NULL;
     }
     if (!s_image_obj) {
@@ -423,6 +423,6 @@ esp_err_t esp_ai_ui_show_bmp_file(const char *path)
     lv_obj_align(s_image_obj, LV_ALIGN_CENTER, 0, 0);
     lv_obj_move_foreground(s_image_obj);
 
-    ESP_LOGI(TAG, "BMP shown: %s src=%dx%d bpp=%u draw=%dx%d", path, src_w, src_h, bpp, draw_w, draw_h);
+    ESP_LOGI(TAG, "BMP显示完成: %s 原图=%dx%d bpp=%u 绘制=%dx%d", path, src_w, src_h, bpp, draw_w, draw_h);
     return ESP_OK;
 }

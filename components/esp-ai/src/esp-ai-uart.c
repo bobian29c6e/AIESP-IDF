@@ -19,7 +19,7 @@ static void asrpro_task(void *pvParameters)
         data = (uint8_t*) heap_caps_malloc(ASR_BUF_SIZE, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     }
     if (!data) {
-        ESP_LOGE(TAG, "ASRPro rx buffer alloc failed");
+        ESP_LOGE(TAG, "ASRPro接收缓冲申请失败");
         vTaskDelete(NULL);
         return;
     }
@@ -58,7 +58,7 @@ esp_err_t esp_ai_uart_init(void)
     BaseType_t task_ok = xTaskCreateWithCaps(asrpro_task, "asrpro_task", 4096, NULL, 5, NULL,
                                              MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (task_ok != pdPASS) {
-        ESP_LOGW(TAG, "ASRPro PSRAM task stack failed, fallback to internal stack");
+        ESP_LOGW(TAG, "ASRPro PSRAM任务栈申请失败，回退到内部SRAM任务栈");
         xTaskCreate(asrpro_task, "asrpro_task", 4096, NULL, 5, NULL);
     }
     ESP_LOGI(TAG, "ASRPro 串口监听任务已启动 (RX:%d, TX:%d)", ASR_RX_PIN, ASR_TX_PIN);

@@ -15,7 +15,7 @@ static const char *TAG = "ESP_AI_SD";
 
 esp_err_t esp_ai_sd_init(void) {
     esp_err_t ret;
-    ESP_LOGI(TAG, "Initializing SD card via SPI");
+    ESP_LOGI(TAG, "正在通过SPI初始化SD卡");
 
     esp_vfs_fat_sdmmc_mount_config_t mount_config = {
         .format_if_mount_failed = false,
@@ -38,10 +38,10 @@ esp_err_t esp_ai_sd_init(void) {
         .max_transfer_sz = 4096,
     };
     
-    ESP_LOGI(TAG, "Initializing SPI bus %d", host.slot);
+    ESP_LOGI(TAG, "正在初始化SPI总线 %d", host.slot);
     ret = spi_bus_initialize(host.slot, &bus_cfg, SDSPI_DEFAULT_DMA);
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to initialize bus.");
+        ESP_LOGE(TAG, "初始化SPI总线失败");
         return ret;
     }
 
@@ -49,19 +49,19 @@ esp_err_t esp_ai_sd_init(void) {
     slot_config.gpio_cs = SD_PIN_NUM_CS;
     slot_config.host_id = host.slot;
 
-    ESP_LOGI(TAG, "Mounting filesystem");
+    ESP_LOGI(TAG, "正在挂载SD文件系统");
     ret = esp_vfs_fat_sdspi_mount(mount_point, &host, &slot_config, &mount_config, &card);
     
     if (ret != ESP_OK) {
         if (ret == ESP_FAIL) {
-            ESP_LOGE(TAG, "Failed to mount filesystem.");
+            ESP_LOGE(TAG, "挂载SD文件系统失败");
         } else {
-            ESP_LOGE(TAG, "Failed to initialize the card (%s).", esp_err_to_name(ret));
+            ESP_LOGE(TAG, "初始化SD卡失败 (%s)", esp_err_to_name(ret));
         }
         return ret;
     }
     
-    ESP_LOGI(TAG, "Filesystem mounted");
+    ESP_LOGI(TAG, "SD文件系统挂载成功");
     sdmmc_card_print_info(stdout, card);
     
     return ESP_OK;

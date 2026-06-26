@@ -19,6 +19,7 @@
 #include "lvgl.h"
 #include "extra/libs/gif/lv_gif.h"
 #include "lwip/dns.h"
+#include "esp_sntp.h"
 #include "cJSON.h"
 #include <string.h>
 #include <stdlib.h>
@@ -38,6 +39,8 @@
 #include "nimble/nimble_port_freertos.h"
 #include "store/config/ble_store_config.h"
 #include "os/os_mbuf.h"
+#include <sys/time.h>
+#include <time.h>
 
 static const char *TAG = "OTAKULINK_APP";
 static char s_display_mode[8] = "auto";
@@ -49,6 +52,14 @@ static int s_screensaver_time_color = 65535;
 static int s_screensaver_date_color = 46527;
 static int64_t s_last_activity_us = 0;
 static bool s_screensaver_active = false;
+static bool s_ui_ready = false;
+static volatile bool s_screensaver_render_requested = false;
+static volatile bool s_restore_last_display_requested = false;
+static int64_t s_last_screensaver_draw_us = 0;
+static int64_t s_last_screensaver_log_us = 0;
+static bool s_last_display_valid = false;
+static char s_last_display_fs_path[96];
+static char s_last_display_lv_src[96];
 static SemaphoreHandle_t s_pending_show_mutex;
 static bool s_pending_show = false;
 static char s_pending_show_fs_path[96];
@@ -62,6 +73,9 @@ static size_t s_char_text_last_pos = 0;
 static bool s_ai_started = false;
 static bool s_ai_start_pending = false;
 static bool s_activation_announced = false;
+static bool s_time_sync_started = false;
+static bool s_time_synced = false;
+static int64_t s_time_sync_last_attempt_us = 0;
 
 static httpd_handle_t start_webserver(void);
 extern void ble_store_config_init(void);
@@ -77,6 +91,14 @@ static bool copy_json_string(cJSON *root, const char *key, char *out, size_t out
 static void save_screensaver_settings(void);
 static int json_get_int_alias(cJSON *root, const char *key1, const char *key2, bool *found);
 static bool parse_rgb565_string(const char *s, int *out_color);
+static void show_boot_status_screen(const char *line1, const char *line2);
+static void render_screensaver_screen(void);
+static void request_restore_last_display(void);
+static void process_restore_last_display(void);
+static void remember_last_display(const char *fs_path, const char *lv_src);
+static bool find_preferred_startup_image(char *fs_path, size_t fs_len, char *lv_src, size_t lv_len);
+static void show_startup_image_or_status(void);
+static esp_err_t show_uploaded_image_now(const char *fs_path, const char *lv_src);
 
 static const char s_default_api_key[] = "";
 static const char s_default_volume[] = "0.7";
@@ -178,17 +200,17 @@ static void load_runtime_config(void)
     s_ai_cfg.server.voice = s_voice_id;
     s_ai_cfg.server.persona = s_persona_id;
     esp_ai_set_volume(strtof(s_volume_str, NULL));
-    ESP_LOGI(TAG, "Runtime config loaded: api_key=%c%c%c%c**** voice=%s volume=%s persona_id=%s personality_len=%u",
+    ESP_LOGI(TAG, "运行配置已加载: api_key=%c%c%c%c**** 音色=%s 音量=%s 人设ID=%s 人设长度=%u",
              s_api_key[0], s_api_key[1], s_api_key[2], s_api_key[3], s_voice_id, s_volume_str,
              s_persona_id, (unsigned)strlen(s_personality));
-    ESP_LOGI(TAG, "WiFi config loaded: ssid=%s pwd_len=%u", s_wifi_ssid, (unsigned)strlen(s_wifi_password));
+    ESP_LOGI(TAG, "WiFi配置已加载: ssid=%s 密码长度=%u", s_wifi_ssid, (unsigned)strlen(s_wifi_password));
 }
 
 static void delayed_restart_task(void *arg)
 {
     int delay_ms = (int)(intptr_t)arg;
     vTaskDelay(pdMS_TO_TICKS(delay_ms));
-    ESP_LOGI(TAG, "Restarting to apply runtime config");
+    ESP_LOGI(TAG, "准备重启以应用运行配置");
     esp_restart();
 }
 
@@ -197,26 +219,306 @@ static void schedule_restart(int delay_ms)
     xTaskCreate(delayed_restart_task, "cfg_restart", 2048, (void *)(intptr_t)delay_ms, 3, NULL);
 }
 
+static bool is_wall_time_valid(time_t now)
+{
+    return now > 1700000000;
+}
+
+static void time_sync_cb(struct timeval *tv)
+{
+    (void)tv;
+    time_t now = 0;
+    time(&now);
+    struct tm tm_info;
+    if (is_wall_time_valid(now) && localtime_r(&now, &tm_info)) {
+        char time_text[16];
+        char date_text[16];
+        strftime(time_text, sizeof(time_text), "%H:%M:%S", &tm_info);
+        strftime(date_text, sizeof(date_text), "%Y-%m-%d", &tm_info);
+        s_time_synced = true;
+        s_screensaver_render_requested = true;
+        ESP_LOGI(TAG, "[时间] NTP同步成功: %s %s", date_text, time_text);
+    } else {
+        ESP_LOGW(TAG, "[时间] NTP回调收到无效时间: %lld", (long long)now);
+    }
+}
+
+static void start_time_sync_if_needed(void)
+{
+    if (s_time_sync_started) {
+        return;
+    }
+
+    setenv("TZ", "CST-8", 1);
+    tzset();
+    esp_sntp_setoperatingmode(ESP_SNTP_OPMODE_POLL);
+    esp_sntp_set_sync_mode(SNTP_SYNC_MODE_IMMED);
+    esp_sntp_setservername(0, "ntp.aliyun.com");
+    esp_sntp_set_sync_interval(60 * 60 * 1000);
+    esp_sntp_set_time_sync_notification_cb(time_sync_cb);
+    s_time_sync_last_attempt_us = esp_timer_get_time();
+    esp_sntp_init();
+    s_time_sync_started = true;
+    ESP_LOGI(TAG, "[时间] 已启动NTP同步 server=ntp.aliyun.com timezone=UTC+8");
+}
+
+static void poll_time_sync(void)
+{
+    time_t now = 0;
+    time(&now);
+    if (is_wall_time_valid(now)) {
+        s_time_synced = true;
+        return;
+    }
+
+    int64_t now_us = esp_timer_get_time();
+    if (s_time_sync_last_attempt_us != 0 &&
+        now_us - s_time_sync_last_attempt_us < 30000000LL) {
+        return;
+    }
+
+    otakulink_system_snapshot_t sys;
+    otakulink_system_get_snapshot(&sys);
+    if (!sys.wifi_connected) {
+        return;
+    }
+
+    if (!s_time_sync_started) {
+        start_time_sync_if_needed();
+        return;
+    }
+
+    s_time_sync_last_attempt_us = now_us;
+    bool restarted = esp_sntp_restart();
+    ESP_LOGW(TAG, "[时间] 当前时间无效，重试NTP同步 result=%d status=%d",
+             restarted ? 1 : 0, esp_sntp_get_sync_status());
+}
+
+static lv_color_t rgb565_to_lv_color(int color)
+{
+    uint16_t c = (uint16_t)color;
+    uint8_t r = (uint8_t)(((c >> 11) & 0x1F) << 3);
+    uint8_t g = (uint8_t)(((c >> 5) & 0x3F) << 2);
+    uint8_t b = (uint8_t)((c & 0x1F) << 3);
+    return lv_color_make(r, g, b);
+}
+
+static const lv_font_t *screensaver_font_for_size(int size, bool is_time)
+{
+    int effective_size = size > 0 ? size : (is_time ? 4 : 2);
+    if (effective_size <= 1) {
+        return LV_FONT_DEFAULT;
+    }
+    if (effective_size == 2) {
+        return &lv_font_montserrat_16;
+    }
+    if (effective_size == 3) {
+        return &lv_font_montserrat_24;
+    }
+    if (effective_size == 4) {
+        if (is_time) {
+            return &lv_font_montserrat_48;
+        }
+        return &lv_font_montserrat_32;
+    }
+    return &lv_font_montserrat_48;
+}
+
+static void draw_center_label(const char *text, lv_coord_t y, lv_color_t color)
+{
+    lv_obj_t *label = lv_label_create(lv_scr_act());
+    lv_label_set_text(label, text ? text : "");
+    lv_obj_set_width(label, 440);
+    lv_label_set_long_mode(label, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_align(label, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+    lv_obj_set_style_text_color(label, color, LV_PART_MAIN);
+    lv_obj_align(label, LV_ALIGN_CENTER, 0, y);
+}
+
+static void show_boot_status_screen(const char *line1, const char *line2)
+{
+    if (!s_ui_ready) {
+        return;
+    }
+    esp_ai_ui_reset_image_state();
+    lv_obj_clean(lv_scr_act());
+    lv_obj_set_style_bg_color(lv_scr_act(), lv_color_hex(0x070A16), LV_PART_MAIN);
+    draw_center_label("OtakuLink", -48, lv_color_hex(0xFFFFFF));
+    draw_center_label(line1 ? line1 : "Starting...", 0, lv_color_hex(0xB8D8FF));
+    draw_center_label(line2 ? line2 : "Waiting...", 30, lv_color_hex(0x7C8AA5));
+    lv_timer_handler();
+    ESP_LOGI(TAG, "[显示] 启动文字已显示: %s / %s",
+             line1 ? line1 : "", line2 ? line2 : "");
+}
+
+static void format_screensaver_time(char *time_buf, size_t time_len, char *date_buf, size_t date_len)
+{
+    time_t now = 0;
+    time(&now);
+    struct tm tm_info;
+    if (is_wall_time_valid(now) && localtime_r(&now, &tm_info)) {
+        strftime(time_buf, time_len, "%H:%M:%S", &tm_info);
+        strftime(date_buf, date_len, "%Y-%m-%d", &tm_info);
+        return;
+    }
+
+    snprintf(time_buf, time_len, "--:--:--");
+    snprintf(date_buf, date_len, s_time_sync_started ? "正在校时" : "等待联网");
+}
+
+static void render_screensaver_screen(void)
+{
+    if (!s_ui_ready || !s_screensaver_active) {
+        return;
+    }
+
+    char time_text[16];
+    char date_text[32];
+    format_screensaver_time(time_text, sizeof(time_text), date_text, sizeof(date_text));
+
+    esp_ai_ui_reset_image_state();
+    lv_obj_clean(lv_scr_act());
+    int64_t now_us = esp_timer_get_time();
+    int64_t now_ms = now_us / 1000;
+    int blue = 30 + (int)((now_ms / 1000) % 30);
+    lv_obj_t *screen = lv_scr_act();
+    lv_obj_set_style_bg_opa(screen, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(screen,
+                              s_screensaver_theme == 0 ? lv_color_make(0, 0, (uint8_t)blue) : lv_color_hex(0x000000),
+                              LV_PART_MAIN);
+    lv_obj_set_style_bg_grad_color(screen, lv_color_hex(0x000000), LV_PART_MAIN);
+    lv_obj_set_style_bg_grad_dir(screen,
+                                 s_screensaver_theme == 0 ? LV_GRAD_DIR_VER : LV_GRAD_DIR_NONE,
+                                 LV_PART_MAIN);
+
+    if (s_screensaver_theme == 0) {
+        for (int i = 0; i < 20; ++i) {
+            lv_obj_t *star = lv_obj_create(screen);
+            lv_obj_remove_style_all(star);
+            lv_obj_set_size(star, 1, 1);
+            lv_obj_set_style_bg_opa(star, LV_OPA_COVER, LV_PART_MAIN);
+            lv_obj_set_style_bg_color(star, lv_color_hex(0xFFFFFF), LV_PART_MAIN);
+            int x = (int)((now_ms * (i + 1) / 10) % 480);
+            int y = (int)((i * 17 + now_ms / 10) % 272);
+            lv_obj_set_pos(star, x, y);
+        }
+    }
+
+    lv_obj_t *time_shadow = lv_label_create(screen);
+    lv_label_set_text(time_shadow, time_text);
+    const lv_font_t *time_font = screensaver_font_for_size(s_screensaver_time_size, true);
+    const lv_font_t *date_font = screensaver_font_for_size(s_screensaver_date_size, false);
+    lv_obj_set_style_text_font(time_shadow, time_font, LV_PART_MAIN);
+    lv_obj_set_style_text_color(time_shadow, lv_color_hex(0x141428), LV_PART_MAIN);
+    lv_obj_set_style_text_align(time_shadow, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+    lv_obj_align(time_shadow, LV_ALIGN_CENTER, 2, -30);
+
+    lv_obj_t *time_label = lv_label_create(screen);
+    lv_label_set_text(time_label, time_text);
+    lv_obj_set_style_text_font(time_label, time_font, LV_PART_MAIN);
+    lv_obj_set_style_text_color(time_label, rgb565_to_lv_color(s_screensaver_time_color), LV_PART_MAIN);
+    lv_obj_set_style_text_align(time_label, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+    lv_obj_align(time_label, LV_ALIGN_CENTER, 0, -32);
+
+    lv_obj_t *date_label = lv_label_create(screen);
+    lv_label_set_text(date_label, date_text);
+    lv_obj_set_style_text_font(date_label, date_font, LV_PART_MAIN);
+    lv_obj_set_style_text_color(date_label, rgb565_to_lv_color(s_screensaver_date_color), LV_PART_MAIN);
+    lv_obj_set_style_text_align(date_label, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+    lv_obj_align(date_label, LV_ALIGN_CENTER, 0, 46);
+
+    lv_timer_handler();
+    s_last_screensaver_draw_us = now_us;
+    if (s_last_screensaver_log_us == 0 || now_us - s_last_screensaver_log_us >= 60000000LL) {
+        s_last_screensaver_log_us = now_us;
+        ESP_LOGI(TAG, "[屏保] 画面已刷新 time=%s date=%s theme=%d",
+                 time_text, date_text, s_screensaver_theme);
+    }
+}
+
+static void request_restore_last_display(void)
+{
+    s_restore_last_display_requested = true;
+}
+
+static void remember_last_display(const char *fs_path, const char *lv_src)
+{
+    if (!fs_path || fs_path[0] == '\0') {
+        return;
+    }
+    strlcpy(s_last_display_fs_path, fs_path, sizeof(s_last_display_fs_path));
+    if (lv_src && lv_src[0] != '\0') {
+        strlcpy(s_last_display_lv_src, lv_src, sizeof(s_last_display_lv_src));
+    } else {
+        s_last_display_lv_src[0] = '\0';
+    }
+    s_last_display_valid = true;
+    ESP_LOGI(TAG, "[显示] 记录最后画面: %s", s_last_display_fs_path);
+}
+
+static void process_restore_last_display(void)
+{
+    if (!s_restore_last_display_requested || !s_ui_ready) {
+        return;
+    }
+    s_restore_last_display_requested = false;
+
+    char fs_path[96] = {0};
+    char lv_src[96] = {0};
+    if (s_last_display_valid) {
+        strlcpy(fs_path, s_last_display_fs_path, sizeof(fs_path));
+        strlcpy(lv_src, s_last_display_lv_src, sizeof(lv_src));
+    } else if (!find_preferred_startup_image(fs_path, sizeof(fs_path), lv_src, sizeof(lv_src))) {
+        show_boot_status_screen("No image", "Waiting for upload");
+        return;
+    }
+
+    ESP_LOGI(TAG, "[屏保] 恢复最后画面: %s", fs_path);
+    esp_err_t err = show_uploaded_image_now(fs_path, lv_src);
+    if (err == ESP_OK) {
+        remember_last_display(fs_path, lv_src);
+    } else {
+        ESP_LOGW(TAG, "[屏保] 恢复最后画面失败: %s err=%s", fs_path, esp_err_to_name(err));
+        show_boot_status_screen("Display restore failed", "Waiting for upload");
+    }
+}
+
 static void notify_activity(const char *reason)
 {
     s_last_activity_us = esp_timer_get_time();
     if (s_screensaver_active) {
         s_screensaver_active = false;
-        ESP_LOGI(TAG, "[SCREENSAVER] exit by %s", reason ? reason : "activity");
+        ESP_LOGI(TAG, "[屏保] 因 %s 退出", reason ? reason : "activity");
+        if (!reason || strcmp(reason, "upload") != 0) {
+            request_restore_last_display();
+        }
     }
 }
 
 static void poll_screensaver_state(void)
 {
-    if (s_screensaver_timeout_ms <= 0 || s_screensaver_active || s_last_activity_us == 0) {
+    if (s_screensaver_timeout_ms <= 0 || s_last_activity_us == 0) {
+        return;
+    }
+
+    if (s_screensaver_active) {
+        int64_t now = esp_timer_get_time();
+        if (s_screensaver_render_requested ||
+            s_last_screensaver_draw_us == 0 ||
+            now - s_last_screensaver_draw_us >= 1000000LL) {
+            s_screensaver_render_requested = false;
+            render_screensaver_screen();
+        }
         return;
     }
 
     int64_t idle_ms = (esp_timer_get_time() - s_last_activity_us) / 1000;
     if (idle_ms >= s_screensaver_timeout_ms) {
         s_screensaver_active = true;
-        ESP_LOGI(TAG, "[SCREENSAVER] active idle_ms=%lld timeout=%d",
+        s_screensaver_render_requested = false;
+        ESP_LOGI(TAG, "[屏保] 已激活 idle_ms=%lld 超时=%d",
                  (long long)idle_ms, s_screensaver_timeout_ms);
+        render_screensaver_screen();
     }
 }
 
@@ -237,16 +539,16 @@ static esp_err_t show_lvgl_image_file(const char *fs_path, const char *lv_src)
 {
     struct stat st;
     if (stat(fs_path, &st) != 0) {
-        ESP_LOGE(TAG, "Image file not found: %s", fs_path);
-        show_decode_error("Image file not found");
+        ESP_LOGE(TAG, "图片文件不存在: %s", fs_path);
+        show_decode_error("图片文件不存在");
         return ESP_FAIL;
     }
 
     lv_img_header_t header;
     lv_res_t res = lv_img_decoder_get_info(lv_src, &header);
     if (res != LV_RES_OK) {
-        ESP_LOGE(TAG, "LVGL cannot decode image: %s size=%ld", lv_src, (long)st.st_size);
-        show_decode_error("Image decode failed");
+        ESP_LOGE(TAG, "LVGL无法解码图片: %s 大小=%ld", lv_src, (long)st.st_size);
+        show_decode_error("图片解码失败");
         return ESP_FAIL;
     }
 
@@ -272,7 +574,7 @@ static esp_err_t show_lvgl_image_file(const char *fs_path, const char *lv_src)
     }
 
     lv_obj_align(img, LV_ALIGN_CENTER, 0, 0);
-    ESP_LOGI(TAG, "LVGL image shown: %s size=%ld src=%dx%d cf=%d zoom=%u",
+    ESP_LOGI(TAG, "LVGL图片显示完成: %s 大小=%ld 原图=%dx%d 色彩格式=%d 缩放=%u",
              lv_src, (long)st.st_size, header.w, header.h, header.cf, zoom);
     return ESP_OK;
 }
@@ -292,8 +594,8 @@ static esp_err_t show_uploaded_image_now(const char *fs_path, const char *lv_src
     if (ext && strcasecmp(ext, ".gif") == 0) {
         struct stat st;
         if (stat(fs_path, &st) != 0) {
-            ESP_LOGE(TAG, "GIF file not found: %s", fs_path);
-            show_decode_error("GIF file not found");
+            ESP_LOGE(TAG, "GIF文件不存在: %s", fs_path);
+            show_decode_error("GIF文件不存在");
             return ESP_FAIL;
         }
 
@@ -305,9 +607,9 @@ static esp_err_t show_uploaded_image_now(const char *fs_path, const char *lv_src
 
         lv_gif_t *gif_obj = (lv_gif_t *)gif;
         if (!gif_obj->gif) {
-            ESP_LOGE(TAG, "LVGL cannot decode GIF: %s size=%ld", lv_src, (long)st.st_size);
+            ESP_LOGE(TAG, "LVGL无法解码GIF: %s 大小=%ld", lv_src, (long)st.st_size);
             lv_obj_del(gif);
-            show_decode_error("GIF decode failed");
+            show_decode_error("GIF解码失败");
             return ESP_FAIL;
         }
 
@@ -326,11 +628,85 @@ static esp_err_t show_uploaded_image_now(const char *fs_path, const char *lv_src
         }
 
         lv_obj_align(gif, LV_ALIGN_CENTER, 0, 0);
-        ESP_LOGI(TAG, "LVGL GIF shown: %s size=%ld src=%dx%d zoom=%u",
+        ESP_LOGI(TAG, "LVGL GIF显示完成: %s 大小=%ld 原图=%dx%d 缩放=%u",
                  lv_src, (long)st.st_size, gif_obj->gif->width, gif_obj->gif->height, zoom);
         return ESP_OK;
     }
     return show_lvgl_image_file(fs_path, lv_src);
+}
+
+static bool file_exists(const char *path, time_t *mtime, off_t *size)
+{
+    struct stat st;
+    if (!path || stat(path, &st) != 0 || !S_ISREG(st.st_mode)) {
+        return false;
+    }
+    if (mtime) {
+        *mtime = st.st_mtime;
+    }
+    if (size) {
+        *size = st.st_size;
+    }
+    return true;
+}
+
+static bool find_preferred_startup_image(char *fs_path, size_t fs_len, char *lv_src, size_t lv_len)
+{
+    static const struct {
+        const char *fs;
+        const char *lv;
+    } candidates[] = {
+        {"/sdcard/upload/photo.bmp", "S:/upload/photo.bmp"},
+        {"/sdcard/upload/photo.jpg", "S:/upload/photo.jpg"},
+        {"/sdcard/upload/photo.png", "S:/upload/photo.png"},
+        {"/sdcard/01.BMP", "S:/01.BMP"},
+    };
+
+    int best_index = -1;
+    time_t best_mtime = 0;
+    off_t best_size = 0;
+    for (size_t i = 0; i < sizeof(candidates) / sizeof(candidates[0]); ++i) {
+        time_t mtime = 0;
+        off_t size = 0;
+        if (!file_exists(candidates[i].fs, &mtime, &size)) {
+            continue;
+        }
+        if (best_index < 0 || mtime > best_mtime || (mtime == best_mtime && size >= best_size)) {
+            best_index = (int)i;
+            best_mtime = mtime;
+            best_size = size;
+        }
+    }
+
+    if (best_index < 0) {
+        return false;
+    }
+
+    strlcpy(fs_path, candidates[best_index].fs, fs_len);
+    strlcpy(lv_src, candidates[best_index].lv, lv_len);
+    ESP_LOGI(TAG, "[显示] 启动候选图片: %s 大小=%ld mtime=%lld",
+             fs_path, (long)best_size, (long long)best_mtime);
+    return true;
+}
+
+static void show_startup_image_or_status(void)
+{
+    char fs_path[96] = {0};
+    char lv_src[96] = {0};
+    if (!find_preferred_startup_image(fs_path, sizeof(fs_path), lv_src, sizeof(lv_src))) {
+        show_boot_status_screen("Waiting for image", "Use Mini Program");
+        ESP_LOGW(TAG, "[显示] 未找到启动图片，保留启动文字");
+        return;
+    }
+
+    ESP_LOGI(TAG, "[显示] 启动显示图片: %s", fs_path);
+    esp_err_t err = show_uploaded_image_now(fs_path, lv_src);
+    if (err == ESP_OK) {
+        remember_last_display(fs_path, lv_src);
+    } else {
+        ESP_LOGW(TAG, "[显示] 启动图片显示失败: %s err=%s", fs_path, esp_err_to_name(err));
+        show_boot_status_screen("Display image failed", "Waiting for upload");
+    }
 }
 
 static void request_show_uploaded_image(const char *fs_path, const char *lv_src)
@@ -344,7 +720,7 @@ static void request_show_uploaded_image(const char *fs_path, const char *lv_src)
         s_pending_show = true;
         xSemaphoreGive(s_pending_show_mutex);
     } else {
-        ESP_LOGW(TAG, "Pending image show lock timeout");
+        ESP_LOGW(TAG, "等待图片显示锁超时");
     }
 }
 
@@ -368,9 +744,12 @@ static void process_pending_image_show(void)
     }
 
     if (should_show) {
-        ESP_LOGI(TAG, "Async image show start: %s", fs_path);
+        ESP_LOGI(TAG, "异步图片显示开始: %s", fs_path);
         esp_err_t err = show_uploaded_image_now(fs_path, lv_src);
-        ESP_LOGI(TAG, "Async image show end: %s err=%s", fs_path, esp_err_to_name(err));
+        if (err == ESP_OK) {
+            remember_last_display(fs_path, lv_src);
+        }
+        ESP_LOGI(TAG, "异步图片显示结束: %s 结果=%s", fs_path, esp_err_to_name(err));
     }
 }
 
@@ -472,7 +851,7 @@ static void refresh_business_ws_config(const char *reason)
         .ext5 = "",
     };
     otakulink_system_set_business_ws_config(&bws_cfg);
-    ESP_LOGI(TAG, "[BWS] config refresh reason=%s volume=%s persona=%s voice=%s",
+    ESP_LOGI(TAG, "[业务WS] 刷新配置 原因=%s 音量=%s 人设=%s 音色=%s",
              reason ? reason : "unknown", s_volume_str, s_persona_id, s_voice_id);
 }
 
@@ -490,9 +869,9 @@ static esp_err_t send_business_ws_root(cJSON *root)
     }
     esp_err_t err = otakulink_business_ws_send_text(text);
     if (err != ESP_OK) {
-        ESP_LOGW(TAG, "[BWS] send skipped/failed err=%s msg=%s", esp_err_to_name(err), text);
+        ESP_LOGW(TAG, "[业务WS] 发送跳过或失败 err=%s 内容=%s", esp_err_to_name(err), text);
     } else {
-        ESP_LOGI(TAG, "[BWS] sent %s", text);
+        ESP_LOGI(TAG, "[业务WS] 已发送 %s", text);
     }
     free(text);
     return err;
@@ -542,7 +921,7 @@ static bool set_volume_and_persist(float volume, const char *reason, bool notify
     snprintf(s_volume_str, sizeof(s_volume_str), "%.2f", volume);
     s_ai_cfg.server.volume = s_volume_str;
     esp_ai_nvs_save("volume", s_volume_str);
-    ESP_LOGI(TAG, "[VOLUME] set %.2f reason=%s", volume, reason ? reason : "unknown");
+    ESP_LOGI(TAG, "[音量] 设置为 %.2f 原因=%s", volume, reason ? reason : "unknown");
     if (notify_server) {
         send_business_ws_volume_update(volume);
     }
@@ -556,7 +935,7 @@ static bool apply_display_mode_value(const char *mode)
         return false;
     }
     strlcpy(s_display_mode, normalized, sizeof(s_display_mode));
-    ESP_LOGI(TAG, "[DISPLAY] mode from command=%s", s_display_mode);
+    ESP_LOGI(TAG, "[显示] 收到模式切换命令=%s", s_display_mode);
     return true;
 }
 
@@ -612,7 +991,7 @@ static bool apply_screensaver_json(cJSON *root)
     }
     if (updated) {
         save_screensaver_settings();
-        ESP_LOGI(TAG, "[SCREENSAVER] settings applied theme=%d timeout=%d time_size=%d date_size=%d time_color=%d date_color=%d",
+        ESP_LOGI(TAG, "[屏保] 设置已应用 主题=%d 超时=%d 时间字号=%d 日期字号=%d 时间颜色=%d 日期颜色=%d",
                  s_screensaver_theme, s_screensaver_timeout_ms,
                  s_screensaver_time_size, s_screensaver_date_size,
                  s_screensaver_time_color, s_screensaver_date_color);
@@ -625,7 +1004,7 @@ static void business_ws_message_handler(const char *type, cJSON *root)
     if (!type) {
         return;
     }
-    ESP_LOGI(TAG, "[BWS] command type=%s", type);
+    ESP_LOGI(TAG, "[业务WS] 收到命令 type=%s", type);
     if (strcmp(type, "__connected") == 0) {
         send_business_ws_systeminfo();
         return;
@@ -704,7 +1083,7 @@ static void business_ws_message_handler(const char *type, cJSON *root)
         if (cJSON_IsString(item)) apply_display_mode_value(item->valuestring);
         return;
     }
-    ESP_LOGI(TAG, "[BWS] command only logged type=%s", type);
+    ESP_LOGI(TAG, "[业务WS] 仅记录命令 type=%s", type);
 }
 
 static void activation_prompt_task(void *arg)
@@ -773,7 +1152,7 @@ void on_ai_command(const char* type, cJSON* data)
             }
         }
         if (status) {
-            ESP_LOGI(TAG, "session_status: %s", status);
+            ESP_LOGI(TAG, "会话状态: %s", status);
         }
         if (status && (strcmp(status, "tts_real_end") == 0 ||
                        strcmp(status, "end") == 0 ||
@@ -803,9 +1182,9 @@ static void start_ai_if_needed(void)
     if (err == ESP_OK) {
         s_ai_started = true;
         refresh_business_ws_config("ai_started");
-        ESP_LOGI(TAG, "ESP-AI started after WiFi got IP");
+        ESP_LOGI(TAG, "WiFi获取IP后已启动ESP-AI服务");
     } else {
-        ESP_LOGE(TAG, "ESP-AI start failed: %s", esp_err_to_name(err));
+        ESP_LOGE(TAG, "ESP-AI启动失败: %s", esp_err_to_name(err));
     }
 }
 
@@ -826,7 +1205,7 @@ static void request_ai_start(void)
     BaseType_t ok = xTaskCreate(ai_start_task, "ai_start", 4096, NULL, 5, NULL);
     if (ok != pdPASS) {
         s_ai_start_pending = false;
-        ESP_LOGE(TAG, "Failed to create ai_start task");
+        ESP_LOGE(TAG, "创建AI启动任务失败");
     }
 }
 
@@ -857,14 +1236,14 @@ static void ble_send_text(const char *text)
     }
     struct os_mbuf *om = ble_hs_mbuf_from_flat(text, strlen(text));
     if (!om) {
-        ESP_LOGW(TAG, "[BLE] notify alloc failed: %s", text);
+        ESP_LOGW(TAG, "[BLE] 通知内存申请失败: %s", text);
         return;
     }
     int rc = ble_gatts_notify_custom(s_ble_conn_handle, s_ble_chr_handle, om);
     if (rc != 0) {
-        ESP_LOGW(TAG, "[BLE] notify failed rc=%d msg=%s", rc, text);
+        ESP_LOGW(TAG, "[BLE] 通知发送失败 rc=%d 内容=%s", rc, text);
     } else {
-        ESP_LOGI(TAG, "[BLE] notify: %s", text);
+        ESP_LOGI(TAG, "[BLE] 已通知: %s", text);
     }
 }
 
@@ -880,7 +1259,7 @@ static bool ble_has_valid_wifi(char *ip_out, size_t ip_out_len)
     char gw[16] = "0.0.0.0";
     esp_ip4addr_ntoa(&ip_info.ip, ip, sizeof(ip));
     esp_ip4addr_ntoa(&ip_info.gw, gw, sizeof(gw));
-    ESP_LOGI(TAG, "[BLE] WiFi检查 ip=%s gw=%s rssi=%d -> %s",
+    ESP_LOGI(TAG, "[BLE] WiFi检查 ip=%s 网关=%s 信号=%d -> %s",
              ip, gw, connected ? ap.rssi : 0, connected ? "OK" : "NOT_CONNECTED");
     if (connected && ip_out && ip_out_len > 0) {
         strlcpy(ip_out, ip, ip_out_len);
@@ -920,7 +1299,7 @@ static void ble_send_wifi_list(char ssids[][33], int count)
         }
     }
     ble_send_text("WIFI_END");
-    ESP_LOGI(TAG, "[BLE] Wi-Fi列表发送完成 count=%d", count);
+    ESP_LOGI(TAG, "[BLE] WiFi列表发送完成 数量=%d", count);
 }
 
 static void ble_wifi_scan_task(void *arg)
@@ -966,7 +1345,7 @@ static void ble_wifi_scan_task(void *arg)
         }
         if (!duplicate) {
             strlcpy(ssids[selected], (const char *)records[i].ssid, sizeof(ssids[selected]));
-            ESP_LOGI(TAG, "[BLE] WiFi %d: %s rssi=%d", selected + 1, ssids[selected], records[i].rssi);
+            ESP_LOGI(TAG, "[BLE] WiFi %d: %s 信号=%d", selected + 1, ssids[selected], records[i].rssi);
             selected++;
         }
     }
@@ -1046,7 +1425,7 @@ static void ble_handle_command(const char *cmd)
             ESP_LOGI(TAG, "[BLE] REQUEST_IP -> 返回 %s", msg);
             ble_send_text(msg);
         } else {
-            ESP_LOGI(TAG, "[BLE] REQUEST_IP -> WIFI_STATUS:NOT_CONNECTED");
+            ESP_LOGI(TAG, "[BLE] REQUEST_IP -> WiFi未连接");
             ble_send_text("WIFI_STATUS:NOT_CONNECTED");
         }
         return;
@@ -1120,14 +1499,14 @@ static int ble_gap_event_cb(struct ble_gap_event *event, void *arg)
     case BLE_GAP_EVENT_CONNECT:
         if (event->connect.status == 0) {
             s_ble_conn_handle = event->connect.conn_handle;
-            ESP_LOGI(TAG, "[BLE] connected handle=%d", s_ble_conn_handle);
+            ESP_LOGI(TAG, "[BLE] 已连接 handle=%d", s_ble_conn_handle);
         } else {
-            ESP_LOGW(TAG, "[BLE] connect failed status=%d", event->connect.status);
+            ESP_LOGW(TAG, "[BLE] 连接失败 status=%d", event->connect.status);
             ble_start_advertising();
         }
         return 0;
     case BLE_GAP_EVENT_DISCONNECT:
-        ESP_LOGI(TAG, "[BLE] disconnected reason=%d", event->disconnect.reason);
+        ESP_LOGI(TAG, "[BLE] 已断开 reason=%d", event->disconnect.reason);
         s_ble_conn_handle = BLE_HS_CONN_HANDLE_NONE;
         s_ble_notify_enabled = false;
         ble_start_advertising();
@@ -1135,7 +1514,7 @@ static int ble_gap_event_cb(struct ble_gap_event *event, void *arg)
     case BLE_GAP_EVENT_SUBSCRIBE:
         if (event->subscribe.attr_handle == s_ble_chr_handle) {
             s_ble_notify_enabled = event->subscribe.cur_notify;
-            ESP_LOGI(TAG, "[BLE] notify=%d", s_ble_notify_enabled ? 1 : 0);
+            ESP_LOGI(TAG, "[BLE] 通知开关=%d", s_ble_notify_enabled ? 1 : 0);
             if (s_ble_notify_enabled) {
                 ble_send_text("BLE_CONNECTED:ESP32已准备就绪，请发送REQUEST_IP获取IP地址");
             }
@@ -1159,7 +1538,7 @@ static void ble_start_advertising(void)
     fields.uuids128_is_complete = 1;
     int rc = ble_gap_adv_set_fields(&fields);
     if (rc != 0) {
-        ESP_LOGE(TAG, "[BLE] adv fields failed rc=%d", rc);
+        ESP_LOGE(TAG, "[BLE] 广播字段设置失败 rc=%d", rc);
         return;
     }
 
@@ -1170,7 +1549,7 @@ static void ble_start_advertising(void)
     rsp_fields.name_is_complete = 1;
     rc = ble_gap_adv_rsp_set_fields(&rsp_fields);
     if (rc != 0) {
-        ESP_LOGE(TAG, "[BLE] adv response fields failed rc=%d", rc);
+        ESP_LOGE(TAG, "[BLE] 广播响应字段设置失败 rc=%d", rc);
         return;
     }
 
@@ -1180,9 +1559,9 @@ static void ble_start_advertising(void)
     adv_params.disc_mode = BLE_GAP_DISC_MODE_GEN;
     rc = ble_gap_adv_start(s_ble_own_addr_type, NULL, BLE_HS_FOREVER, &adv_params, ble_gap_event_cb, NULL);
     if (rc != 0) {
-        ESP_LOGE(TAG, "[BLE] adv start failed rc=%d", rc);
+        ESP_LOGE(TAG, "[BLE] 开始广播失败 rc=%d", rc);
     } else {
-        ESP_LOGI(TAG, "[BLE] advertising as %s addr_type=%u", BLE_DEVICE_NAME, s_ble_own_addr_type);
+        ESP_LOGI(TAG, "[BLE] 正在广播 名称=%s 地址类型=%u", BLE_DEVICE_NAME, s_ble_own_addr_type);
     }
 }
 
@@ -1190,7 +1569,7 @@ static void ble_on_sync(void)
 {
     int rc = ble_hs_id_infer_auto(0, &s_ble_own_addr_type);
     if (rc != 0) {
-        ESP_LOGE(TAG, "[BLE] infer addr type failed rc=%d", rc);
+        ESP_LOGE(TAG, "[BLE] 推断地址类型失败 rc=%d", rc);
         return;
     }
     ble_start_advertising();
@@ -1198,7 +1577,7 @@ static void ble_on_sync(void)
 
 static void ble_on_reset(int reason)
 {
-    ESP_LOGE(TAG, "[BLE] reset reason=%d", reason);
+    ESP_LOGE(TAG, "[BLE] 重置 reason=%d", reason);
 }
 
 static void ble_host_task(void *param)
@@ -1215,7 +1594,7 @@ static void ble_start_service(void)
 
     esp_err_t err = nimble_port_init();
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "[BLE] nimble init failed: %s", esp_err_to_name(err));
+        ESP_LOGE(TAG, "[BLE] NimBLE初始化失败: %s", esp_err_to_name(err));
         return;
     }
     ble_hs_cfg.reset_cb = ble_on_reset;
@@ -1225,14 +1604,14 @@ static void ble_start_service(void)
     ble_svc_gap_init();
     ble_svc_gatt_init();
     int rc = ble_svc_gap_device_name_set(BLE_DEVICE_NAME);
-    if (rc != 0) ESP_LOGW(TAG, "[BLE] set name rc=%d", rc);
+    if (rc != 0) ESP_LOGW(TAG, "[BLE] 设置名称返回 rc=%d", rc);
     rc = ble_gatts_count_cfg(s_ble_services);
-    if (rc != 0) ESP_LOGE(TAG, "[BLE] count cfg rc=%d", rc);
+    if (rc != 0) ESP_LOGE(TAG, "[BLE] 服务计数配置失败 rc=%d", rc);
     rc = ble_gatts_add_svcs(s_ble_services);
-    if (rc != 0) ESP_LOGE(TAG, "[BLE] add svcs rc=%d", rc);
+    if (rc != 0) ESP_LOGE(TAG, "[BLE] 添加服务失败 rc=%d", rc);
     ble_store_config_init();
     nimble_port_freertos_init(ble_host_task);
-    ESP_LOGI(TAG, "[BLE] BLE 初始化完成，开始广播");
+    ESP_LOGI(TAG, "[BLE] BLE初始化完成，开始广播");
 }
 
 /* GET /status 处理程序 */
@@ -1416,7 +1795,7 @@ static bool resolve_agent_key_from_user_key(const char *input_key, char *agent_k
         response = heap_caps_malloc(resp_cap, MALLOC_CAP_8BIT);
     }
     if (!response) {
-        ESP_LOGW(TAG, "[APIKEY] no memory for equipment/list response");
+        ESP_LOGW(TAG, "[APIKEY] equipment/list响应内存不足");
         return false;
     }
     response[0] = '\0';
@@ -1452,9 +1831,9 @@ static bool resolve_agent_key_from_user_key(const char *input_key, char *agent_k
     bool ok = false;
     if (err == ESP_OK && status == 200) {
         ok = extract_agent_key_from_equipment_response(response, agent_key, agent_key_len);
-        ESP_LOGI(TAG, "[APIKEY] equipment/list status=%d bytes=%u resolved=%d", status, (unsigned)collect.len, ok ? 1 : 0);
+        ESP_LOGI(TAG, "[APIKEY] equipment/list返回 status=%d 字节=%u 解析成功=%d", status, (unsigned)collect.len, ok ? 1 : 0);
     } else {
-        ESP_LOGW(TAG, "[APIKEY] equipment/list failed err=%s status=%d", esp_err_to_name(err), status);
+        ESP_LOGW(TAG, "[APIKEY] equipment/list请求失败 err=%s status=%d", esp_err_to_name(err), status);
     }
     heap_caps_free(response);
     return ok;
@@ -1507,6 +1886,151 @@ static const char *detect_upload_kind(const char *filename, const char *content_
     return NULL;
 }
 
+static const char *detect_upload_kind_from_magic(const uint8_t *data, size_t len)
+{
+    if (!data || len < 4) return NULL;
+    if (len >= 8 &&
+        data[0] == 0x89 && data[1] == 'P' && data[2] == 'N' && data[3] == 'G' &&
+        data[4] == '\r' && data[5] == '\n' && data[6] == 0x1A && data[7] == '\n') {
+        return "png";
+    }
+    if (data[0] == 0xFF && data[1] == 0xD8 && data[2] == 0xFF) {
+        return "jpg";
+    }
+    if (len >= 6 &&
+        data[0] == 'G' && data[1] == 'I' && data[2] == 'F' &&
+        data[3] == '8' && (data[4] == '7' || data[4] == '9') && data[5] == 'a') {
+        return "gif";
+    }
+    if (data[0] == 'B' && data[1] == 'M') {
+        return "bmp";
+    }
+    return NULL;
+}
+
+static bool extract_quoted_value(const char *src, const char *key, char *out, size_t out_len);
+
+static bool parse_multipart_boundary(const char *content_type, char *boundary, size_t boundary_len)
+{
+    if (!content_type || !boundary || boundary_len == 0) return false;
+    const char *boundary_key = strstr(content_type, "boundary=");
+    if (!boundary_key) return false;
+
+    strlcpy(boundary, boundary_key + strlen("boundary="), boundary_len);
+    char *semi = strchr(boundary, ';');
+    if (semi) *semi = '\0';
+    if (boundary[0] == '"') {
+        memmove(boundary, boundary + 1, strlen(boundary));
+        char *quote = strchr(boundary, '"');
+        if (quote) *quote = '\0';
+    }
+    return boundary[0] != '\0';
+}
+
+static bool parse_multipart_file_part(const uint8_t *body, size_t body_len,
+                                      const char *boundary,
+                                      const uint8_t **file_data,
+                                      size_t *file_len,
+                                      char *filename,
+                                      size_t filename_len,
+                                      char *part_type,
+                                      size_t part_type_len)
+{
+    if (!body || body_len == 0 || !boundary || !file_data || !file_len) return false;
+
+    char boundary_line[128];
+    snprintf(boundary_line, sizeof(boundary_line), "--%s", boundary);
+    const size_t boundary_line_len = strlen(boundary_line);
+    const uint8_t *end = body + body_len;
+    const uint8_t *cursor = body;
+    int part_index = 0;
+
+    const uint8_t *first = find_bytes(cursor, (size_t)(end - cursor), boundary_line, boundary_line_len);
+    if (!first) return false;
+    cursor = first + boundary_line_len;
+
+    while (cursor < end) {
+        if ((size_t)(end - cursor) >= 2 && cursor[0] == '-' && cursor[1] == '-') {
+            break;
+        }
+        if ((size_t)(end - cursor) >= 2 && cursor[0] == '\r' && cursor[1] == '\n') {
+            cursor += 2;
+        }
+
+        const uint8_t *header_end = find_bytes(cursor, (size_t)(end - cursor), "\r\n\r\n", 4);
+        if (!header_end) break;
+        size_t header_len = (size_t)(header_end - cursor);
+        if (header_len > 4096) {
+            ESP_LOGW(TAG, "[上传] multipart字段头过大 index=%d header=%u", part_index, (unsigned)header_len);
+            return false;
+        }
+
+        char *header = heap_caps_malloc(header_len + 1, MALLOC_CAP_8BIT);
+        if (!header) return false;
+        memcpy(header, cursor, header_len);
+        header[header_len] = '\0';
+
+        char part_filename[96] = {0};
+        char current_type[96] = {0};
+        extract_quoted_value(header, "filename=\"", part_filename, sizeof(part_filename));
+        char *ct = strstr(header, "Content-Type:");
+        if (ct) {
+            ct += strlen("Content-Type:");
+            while (*ct == ' ') ct++;
+            char *line_end = strstr(ct, "\r\n");
+            size_t len = line_end ? (size_t)(line_end - ct) : strlen(ct);
+            if (len >= sizeof(current_type)) len = sizeof(current_type) - 1;
+            memcpy(current_type, ct, len);
+            current_type[len] = '\0';
+        }
+        heap_caps_free(header);
+
+        const uint8_t *data_start = header_end + 4;
+        char next_marker[132];
+        snprintf(next_marker, sizeof(next_marker), "\r\n--%s", boundary);
+        const uint8_t *next = find_bytes(data_start, (size_t)(end - data_start), next_marker, strlen(next_marker));
+        if (!next) break;
+        size_t current_len = (size_t)(next - data_start);
+
+        const char *kind = detect_upload_kind(part_filename, current_type);
+        if (!kind) {
+            kind = detect_upload_kind_from_magic(data_start, current_len);
+        }
+
+        if (kind) {
+            *file_data = data_start;
+            *file_len = current_len;
+            if (filename && filename_len > 0) strlcpy(filename, part_filename, filename_len);
+            if (part_type && part_type_len > 0) strlcpy(part_type, current_type, part_type_len);
+            ESP_LOGI(TAG, "[上传] multipart选中文件字段 index=%d 文件名=%s 类型=%s 格式=%s 字节=%u",
+                     part_index,
+                     part_filename[0] ? part_filename : "(none)",
+                     current_type[0] ? current_type : "(none)",
+                     kind,
+                     (unsigned)current_len);
+            return true;
+        }
+
+        ESP_LOGI(TAG, "[上传] 跳过非文件字段 index=%d 文件名=%s 类型=%s 字节=%u 文件头=%02x %02x %02x %02x",
+                 part_index,
+                 part_filename[0] ? part_filename : "(none)",
+                 current_type[0] ? current_type : "(none)",
+                 (unsigned)current_len,
+                 current_len > 0 ? data_start[0] : 0,
+                 current_len > 1 ? data_start[1] : 0,
+                 current_len > 2 ? data_start[2] : 0,
+                 current_len > 3 ? data_start[3] : 0);
+
+        cursor = next + 2 + boundary_line_len;
+        part_index++;
+    }
+
+    return false;
+}
+
+static const int64_t UPLOAD_RECV_IDLE_TIMEOUT_MS = 90000;
+static const int64_t UPLOAD_RECV_TOTAL_TIMEOUT_MS = 300000;
+
 static bool extract_quoted_value(const char *src, const char *key, char *out, size_t out_len)
 {
     const char *p = strstr(src, key);
@@ -1552,14 +2076,14 @@ static esp_err_t save_upload_file(const char *final_path, const uint8_t *data, s
         chunk = (uint8_t *)heap_caps_malloc(actual_chunk, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT | MALLOC_CAP_DMA);
     }
     if (!chunk) {
-        ESP_LOGE(TAG, "Upload no internal chunk buffer");
+        ESP_LOGE(TAG, "上传失败: 无法申请内部写入缓冲");
         return ESP_ERR_NO_MEM;
     }
 
     unlink(tmp_path);
     int fd = open(tmp_path, O_WRONLY | O_CREAT | O_TRUNC, 0666);
     if (fd < 0) {
-        ESP_LOGE(TAG, "Upload open failed: %s", tmp_path);
+        ESP_LOGE(TAG, "上传失败: 无法打开临时文件 %s", tmp_path);
         free(chunk);
         return ESP_FAIL;
     }
@@ -1572,7 +2096,7 @@ static esp_err_t save_upload_file(const char *final_path, const uint8_t *data, s
         memcpy(chunk, data + written_total, n);
         ssize_t written = write(fd, chunk, n);
         if (written <= 0 || (size_t)written != n) {
-            ESP_LOGE(TAG, "Upload write incomplete: %u/%u ret=%d", (unsigned)written_total, (unsigned)len, (int)written);
+            ESP_LOGE(TAG, "上传失败: 写入不完整 已写=%u 总大小=%u ret=%d", (unsigned)written_total, (unsigned)len, (int)written);
             close(fd);
             free(chunk);
             unlink(tmp_path);
@@ -1587,11 +2111,11 @@ static esp_err_t save_upload_file(const char *final_path, const uint8_t *data, s
     unlink(final_path);
     int64_t before_rename = esp_timer_get_time();
     if (rename(tmp_path, final_path) != 0) {
-        ESP_LOGE(TAG, "Upload rename failed: %s -> %s", tmp_path, final_path);
+        ESP_LOGE(TAG, "上传失败: 文件替换失败 %s -> %s", tmp_path, final_path);
         unlink(tmp_path);
         return ESP_FAIL;
     }
-    ESP_LOGI(TAG, "[UPLOAD] sd_write chunksz=%u write=%lldms close=%lldms rename=%lldms",
+    ESP_LOGI(TAG, "[上传] SD写入完成 分块=%u 写入=%lldms 关闭=%lldms 替换=%lldms",
              (unsigned)actual_chunk,
              (long long)((before_close - write_started) / 1000),
              (long long)((before_rename - before_close) / 1000),
@@ -1632,7 +2156,7 @@ static esp_err_t finalize_upload_tmp_file(const char *tmp_path, const char *fina
     int64_t before_rename = esp_timer_get_time();
     unlink(final_path);
     if (rename(tmp_path, final_path) != 0) {
-        ESP_LOGE(TAG, "Upload rename failed: %s -> %s", tmp_path, final_path);
+        ESP_LOGE(TAG, "上传失败: 文件替换失败 %s -> %s", tmp_path, final_path);
         unlink(tmp_path);
         return ESP_FAIL;
     }
@@ -1795,8 +2319,8 @@ static esp_err_t stream_multipart_upload_to_sd(httpd_req_t *req,
             if (ret == HTTPD_SOCK_ERR_TIMEOUT) {
                 int64_t idle_ms = (now - last_data) / 1000;
                 int64_t total_ms = (now - started) / 1000;
-                if (idle_ms > 15000 || total_ms > 180000) {
-                    ESP_LOGW(TAG, "[UPLOAD] stream timeout offset=%u/%u idle=%lldms total=%lldms",
+                if (idle_ms > UPLOAD_RECV_IDLE_TIMEOUT_MS || total_ms > UPLOAD_RECV_TOTAL_TIMEOUT_MS) {
+                    ESP_LOGW(TAG, "[上传] 流式接收超时 已收=%u/%u 空闲=%lldms 总耗时=%lldms",
                              (unsigned)received, (unsigned)req->content_len,
                              (long long)idle_ms, (long long)total_ms);
                     *out_status_code = 408;
@@ -1806,7 +2330,7 @@ static esp_err_t stream_multipart_upload_to_sd(httpd_req_t *req,
                 vTaskDelay(pdMS_TO_TICKS(10));
                 continue;
             }
-            ESP_LOGW(TAG, "[UPLOAD] stream recv failed offset=%u/%u ret=%d",
+            ESP_LOGW(TAG, "[上传] 流式接收失败 已收=%u/%u ret=%d",
                      (unsigned)received, (unsigned)req->content_len, ret);
             *out_status_code = 408;
             *out_error = "RECV_FAILED";
@@ -1816,7 +2340,7 @@ static esp_err_t stream_multipart_upload_to_sd(httpd_req_t *req,
         received += (size_t)ret;
         last_data = now;
         if ((received % (128 * 1024)) < (size_t)ret || received == req->content_len) {
-            ESP_LOGI(TAG, "[UPLOAD] stream recv %u/%u file=%u elapsed=%lldms",
+            ESP_LOGI(TAG, "[上传] 流式接收进度 %u/%u 文件=%u 耗时=%lldms",
                      (unsigned)received, (unsigned)req->content_len, (unsigned)st.file_len,
                      (long long)((now - started) / 1000));
         }
@@ -1859,8 +2383,21 @@ static esp_err_t stream_multipart_upload_to_sd(httpd_req_t *req,
             }
             heap_caps_free(header);
 
+            size_t data_offset = (size_t)((header_end + 4) - header_buf);
+            size_t data_len = header_used - data_offset;
             const char *kind = detect_upload_kind(filename, part_type);
             if (!kind) {
+                kind = detect_upload_kind_from_magic(header_buf + data_offset, data_len);
+            }
+            if (!kind) {
+                ESP_LOGW(TAG, "[上传] 流式类型不支持 header=%u 文件名=%s 类型=%s 文件头=%02x %02x %02x %02x",
+                         (unsigned)header_len,
+                         filename[0] ? filename : "(none)",
+                         part_type[0] ? part_type : "(none)",
+                         data_len > 0 ? header_buf[data_offset + 0] : 0,
+                         data_len > 1 ? header_buf[data_offset + 1] : 0,
+                         data_len > 2 ? header_buf[data_offset + 2] : 0,
+                         data_len > 3 ? header_buf[data_offset + 3] : 0);
                 *out_status_code = 415;
                 *out_error = "UNSUPPORTED_TYPE";
                 goto cleanup;
@@ -1877,10 +2414,12 @@ static esp_err_t stream_multipart_upload_to_sd(httpd_req_t *req,
             write_started = esp_timer_get_time();
             header_done = true;
 
-            size_t data_offset = (size_t)((header_end + 4) - header_buf);
-            size_t data_len = header_used - data_offset;
-            ESP_LOGI(TAG, "[UPLOAD] stream header=%u filename=%s type=%s final=%s",
-                     (unsigned)header_len, filename, part_type, final_path);
+            ESP_LOGI(TAG, "[上传] 流式头解析完成 header=%u 文件名=%s 类型=%s 格式=%s 保存到=%s",
+                     (unsigned)header_len,
+                     filename[0] ? filename : "(none)",
+                     part_type[0] ? part_type : "(none)",
+                     kind,
+                     final_path);
             if (data_len > 0 && upload_stream_write_file_bytes(&st, header_buf + data_offset, data_len) != ESP_OK) {
                 *out_status_code = 500;
                 *out_error = "SAVE_FAILED";
@@ -1917,7 +2456,7 @@ static esp_err_t stream_multipart_upload_to_sd(httpd_req_t *req,
     }
 
     *out_file_len = st.file_len;
-    ESP_LOGI(TAG, "[UPLOAD] stream saved bytes=%u write=%lldms close=%lldms rename=%lldms elapsed=%lldms heap=%lu psram=%lu",
+    ESP_LOGI(TAG, "[上传] 流式保存完成 字节=%u 写入=%lldms 关闭=%lldms 替换=%lldms 总耗时=%lldms SRAM=%lu PSRAM=%lu",
              (unsigned)st.file_len,
              (long long)((before_close - write_started) / 1000),
              (long long)((after_close - before_close) / 1000),
@@ -1981,7 +2520,15 @@ static esp_err_t api_status_get_handler(httpd_req_t *req)
 
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, resp_str, HTTPD_RESP_USE_STRLEN);
-    ESP_LOGI(TAG, "[HTTP] /api/status -> %s", resp_str);
+    ESP_LOGI(TAG, "[HTTP] /api/status 已返回 AI=%d 忙碌=%d 业务WS=%d 上传=%d SRAM=%luKB PSRAM=%luKB 最大连续=%luKB 信号=%d",
+             ws_connected ? 1 : 0,
+             busy ? 1 : 0,
+             sys.business_ws_connected ? 1 : 0,
+             sys.upload_active ? 1 : 0,
+             (unsigned long)(sys.free_sram / 1024),
+             (unsigned long)(sys.free_psram / 1024),
+             (unsigned long)(sys.max_sram_block / 1024),
+             sys.rssi);
     return ESP_OK;
 }
 
@@ -2029,7 +2576,7 @@ static esp_err_t get_voice_config_handler(httpd_req_t *req)
         cJSON_Delete(root);
         heap_caps_free(body);
 
-        ESP_LOGI(TAG, "[HTTP] voice config saved updated=%d voice=%s persona_id=%s personality_len=%u",
+        ESP_LOGI(TAG, "[HTTP] 语音配置已保存 updated=%d 音色=%s 人设ID=%s 人设长度=%u",
                  updated ? 1 : 0, s_voice_id, s_persona_id, (unsigned)strlen(s_personality));
     }
 
@@ -2043,7 +2590,7 @@ static esp_err_t get_voice_config_handler(httpd_req_t *req)
     char *json = cJSON_PrintUnformatted(root);
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, json, HTTPD_RESP_USE_STRLEN);
-    ESP_LOGI(TAG, "[HTTP] /api/getVoiceConfig sent");
+    ESP_LOGI(TAG, "[HTTP] /api/getVoiceConfig 已返回");
     free(json);
     cJSON_Delete(root);
     return ESP_OK;
@@ -2133,7 +2680,7 @@ static esp_err_t apikey_handler(httpd_req_t *req)
     s_ai_cfg.server.ext1 = s_ext1;
     esp_ai_nvs_save("api_key", s_api_key);
     esp_ai_nvs_save("ext1", s_ext1);
-    ESP_LOGI(TAG, "[HTTP] API key saved, resolved_from_user=%d, scheduling restart", resolved_from_user_key ? 1 : 0);
+    ESP_LOGI(TAG, "[HTTP] API Key已保存 来自用户Key解析=%d 准备重启", resolved_from_user_key ? 1 : 0);
 
     httpd_resp_set_type(req, "application/json");
     if (resolved_from_user_key) {
@@ -2313,7 +2860,7 @@ static esp_err_t screensaver_settings_handler(httpd_req_t *req)
         }
         if (updated) {
             save_screensaver_settings();
-            ESP_LOGI(TAG, "[HTTP] screensaver GET settings saved theme=%d timeout=%d",
+            ESP_LOGI(TAG, "[HTTP] 屏保GET设置已保存 主题=%d 超时=%d",
                      s_screensaver_theme, s_screensaver_timeout_ms);
         }
     }
@@ -2331,7 +2878,7 @@ static esp_err_t screensaver_settings_handler(httpd_req_t *req)
 
         updated = apply_screensaver_json(root);
 
-        ESP_LOGI(TAG, "[HTTP] screensaver settings saved theme=%d timeout=%d",
+        ESP_LOGI(TAG, "[HTTP] 屏保设置已保存 主题=%d 超时=%d",
                  s_screensaver_theme, s_screensaver_timeout_ms);
         cJSON_Delete(root);
         heap_caps_free(body);
@@ -2393,7 +2940,7 @@ static esp_err_t upload_post_handler(httpd_req_t *req)
     int status_code = 200;
     const char *error = NULL;
 
-    ESP_LOGI(TAG, "[UPLOAD] start len=%u free_sram=%lu free_psram=%lu",
+    ESP_LOGI(TAG, "[上传] 开始 总长度=%u 可用SRAM=%lu 可用PSRAM=%lu",
              (unsigned)body_len,
              (unsigned long)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
              (unsigned long)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
@@ -2409,7 +2956,7 @@ static esp_err_t upload_post_handler(httpd_req_t *req)
 
     const size_t stream_upload_threshold = 2 * 1024 * 1024;
     if (strstr(content_type, "multipart/form-data") && body_len > stream_upload_threshold) {
-        ESP_LOGI(TAG, "[UPLOAD] using stream path threshold=%u", (unsigned)stream_upload_threshold);
+        ESP_LOGI(TAG, "[上传] 使用流式路径 阈值=%u", (unsigned)stream_upload_threshold);
         esp_err_t stream_err = stream_multipart_upload_to_sd(req,
                                                              content_type,
                                                              started,
@@ -2428,12 +2975,12 @@ static esp_err_t upload_post_handler(httpd_req_t *req)
             cleanup_static_uploads_except(final_path);
             request_show_uploaded_image(final_path, lv_src);
         }
-        ESP_LOGI(TAG, "[UPLOAD] saved stream file=%s bytes=%u elapsed=%lldms",
+        ESP_LOGI(TAG, "[上传] 流式文件已保存 文件=%s 字节=%u 耗时=%lldms",
                  final_path, (unsigned)file_len, (long long)((esp_timer_get_time() - started) / 1000));
         goto done;
     }
     if (strstr(content_type, "multipart/form-data")) {
-        ESP_LOGI(TAG, "[UPLOAD] using buffered path threshold=%u", (unsigned)stream_upload_threshold);
+        ESP_LOGI(TAG, "[上传] 使用缓冲路径 阈值=%u", (unsigned)stream_upload_threshold);
     }
 
     body = heap_caps_malloc(body_len + 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
@@ -2454,7 +3001,7 @@ static esp_err_t upload_post_handler(httpd_req_t *req)
             offset += (size_t)ret;
             last_data = now;
             if ((offset % (128 * 1024)) < (size_t)ret || offset == body_len) {
-                ESP_LOGI(TAG, "[UPLOAD] recv progress %u/%u elapsed=%lldms",
+                ESP_LOGI(TAG, "[上传] 接收进度 %u/%u 耗时=%lldms",
                          (unsigned)offset, (unsigned)body_len, (long long)((now - started) / 1000));
             }
             continue;
@@ -2463,8 +3010,8 @@ static esp_err_t upload_post_handler(httpd_req_t *req)
         if (ret == HTTPD_SOCK_ERR_TIMEOUT) {
             int64_t idle_ms = (now - last_data) / 1000;
             int64_t total_ms = (now - started) / 1000;
-            if (idle_ms > 15000 || total_ms > 180000) {
-                ESP_LOGW(TAG, "[UPLOAD] recv timeout offset=%u/%u idle=%lldms total=%lldms",
+            if (idle_ms > UPLOAD_RECV_IDLE_TIMEOUT_MS || total_ms > UPLOAD_RECV_TOTAL_TIMEOUT_MS) {
+                ESP_LOGW(TAG, "[上传] 接收超时 已收=%u/%u 空闲=%lldms 总耗时=%lldms",
                          (unsigned)offset, (unsigned)body_len, (long long)idle_ms, (long long)total_ms);
                 status_code = 408;
                 error = "RECV_TIMEOUT";
@@ -2474,7 +3021,7 @@ static esp_err_t upload_post_handler(httpd_req_t *req)
             continue;
         }
 
-        ESP_LOGW(TAG, "[UPLOAD] recv failed offset=%u/%u ret=%d", (unsigned)offset, (unsigned)body_len, ret);
+        ESP_LOGW(TAG, "[上传] 接收失败 已收=%u/%u ret=%d", (unsigned)offset, (unsigned)body_len, ret);
         status_code = 408;
         error = "RECV_FAILED";
         goto done;
@@ -2487,57 +3034,28 @@ static esp_err_t upload_post_handler(httpd_req_t *req)
     char part_type[96] = {0};
 
     if (strstr(content_type, "multipart/form-data")) {
-        const char *boundary_key = strstr(content_type, "boundary=");
-        if (!boundary_key) {
+        char boundary[96];
+        if (!parse_multipart_boundary(content_type, boundary, sizeof(boundary))) {
             status_code = 400;
             error = "NO_BOUNDARY";
             goto done;
         }
-        const char *boundary = boundary_key + strlen("boundary=");
-        char marker[96];
-        snprintf(marker, sizeof(marker), "\r\n--%s", boundary);
 
         int64_t parse_started = esp_timer_get_time();
-        const uint8_t *header_end = find_bytes(body, body_len, "\r\n\r\n", 4);
-        if (!header_end) {
+        if (!parse_multipart_file_part(body, body_len,
+                                       boundary,
+                                       &file_data,
+                                       &file_len,
+                                       filename,
+                                       sizeof(filename),
+                                       part_type,
+                                       sizeof(part_type))) {
             status_code = 400;
-            error = "BAD_MULTIPART";
+            error = "NO_FILE_PART";
             goto done;
         }
-
-        size_t header_len = (size_t)(header_end - body);
-        char *header = heap_caps_malloc(header_len + 1, MALLOC_CAP_8BIT);
-        if (!header) {
-            status_code = 500;
-            error = "NO_MEMORY";
-            goto done;
-        }
-        memcpy(header, body, header_len);
-        header[header_len] = '\0';
-        extract_quoted_value(header, "filename=\"", filename, sizeof(filename));
-        char *ct = strstr(header, "Content-Type:");
-        if (ct) {
-            ct += strlen("Content-Type:");
-            while (*ct == ' ') ct++;
-            char *line_end = strstr(ct, "\r\n");
-            size_t len = line_end ? (size_t)(line_end - ct) : strlen(ct);
-            if (len >= sizeof(part_type)) len = sizeof(part_type) - 1;
-            memcpy(part_type, ct, len);
-            part_type[len] = '\0';
-        }
-        heap_caps_free(header);
-
-        file_data = header_end + 4;
-        size_t remain = body_len - (size_t)(file_data - body);
-        const uint8_t *file_end = find_bytes_reverse(file_data, remain, marker, strlen(marker));
-        if (!file_end || file_end < file_data) {
-            status_code = 400;
-            error = "NO_MULTIPART_END";
-            goto done;
-        }
-        file_len = (size_t)(file_end - file_data);
-        ESP_LOGI(TAG, "[UPLOAD] multipart parsed header=%u file=%u dt=%lldms",
-                 (unsigned)header_len, (unsigned)file_len,
+        ESP_LOGI(TAG, "[上传] multipart解析完成 文件=%u 耗时=%lldms",
+                 (unsigned)file_len,
                  (long long)((esp_timer_get_time() - parse_started) / 1000));
     } else {
         strlcpy(part_type, content_type, sizeof(part_type));
@@ -2549,10 +3067,24 @@ static esp_err_t upload_post_handler(httpd_req_t *req)
 
     kind = detect_upload_kind(filename, part_type);
     if (!kind) {
+        kind = detect_upload_kind_from_magic(file_data, file_len);
+    }
+    if (!kind) {
+        ESP_LOGW(TAG, "[上传] 类型不支持 文件名=%s 类型=%s 文件头=%02x %02x %02x %02x",
+                 filename[0] ? filename : "(none)",
+                 part_type[0] ? part_type : "(none)",
+                 file_len > 0 ? file_data[0] : 0,
+                 file_len > 1 ? file_data[1] : 0,
+                 file_len > 2 ? file_data[2] : 0,
+                 file_len > 3 ? file_data[3] : 0);
         status_code = 415;
         error = "UNSUPPORTED_TYPE";
         goto done;
     }
+    ESP_LOGI(TAG, "[上传] 已识别格式=%s 文件名=%s 类型=%s",
+             kind,
+             filename[0] ? filename : "(none)",
+             part_type[0] ? part_type : "(none)");
 
     mkdir("/sdcard/upload", 0775);
     mkdir("/sdcard/gif", 0775);
@@ -2582,7 +3114,7 @@ static esp_err_t upload_post_handler(httpd_req_t *req)
         request_show_uploaded_image(final_path, lv_src);
     }
 
-    ESP_LOGI(TAG, "[UPLOAD] saved kind=%s file=%s bytes=%u elapsed=%lldms",
+    ESP_LOGI(TAG, "[上传] 保存完成 格式=%s 文件=%s 字节=%u 耗时=%lldms",
              kind, final_path, (unsigned)file_len, (long long)((esp_timer_get_time() - started) / 1000));
 
 done:
@@ -2592,7 +3124,7 @@ done:
     esp_ai_set_upload_active(false);
 
     if (error) {
-        ESP_LOGW(TAG, "[UPLOAD] failed error=%s status=%d elapsed=%lldms",
+        ESP_LOGW(TAG, "[上传] 失败 错误=%s HTTP状态=%d 耗时=%lldms",
                  error, status_code, (long long)((esp_timer_get_time() - started) / 1000));
         if (status_code == 400) httpd_resp_set_status(req, "400 Bad Request");
         else if (status_code == 408) httpd_resp_set_status(req, "408 Request Timeout");
@@ -2704,7 +3236,7 @@ static esp_err_t char_text_post_handler(httpd_req_t *req)
         return ESP_OK;
     }
 
-    ESP_LOGI(TAG, "[HTTP] /api/char_text start text_len=%u", (unsigned)strlen(text_copy));
+    ESP_LOGI(TAG, "[HTTP] /api/char_text 开始 文本长度=%u", (unsigned)strlen(text_copy));
     httpd_resp_set_type(req, "text/event-stream");
     httpd_resp_set_hdr(req, "Cache-Control", "no-cache");
     httpd_resp_set_hdr(req, "Connection", "keep-alive");
@@ -2865,7 +3397,7 @@ static esp_err_t register_route(httpd_handle_t server, const httpd_uri_t *route)
 {
     esp_err_t err = httpd_register_uri_handler(server, route);
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "HTTP route register failed: uri=%s method=%d err=%s",
+        ESP_LOGE(TAG, "HTTP路由注册失败: uri=%s method=%d err=%s",
                  route->uri, route->method, esp_err_to_name(err));
     }
     return err;
@@ -2875,13 +3407,15 @@ static httpd_handle_t start_webserver(void)
 {
     static httpd_handle_t server = NULL;
     if (server) {
-        ESP_LOGI(TAG, "HTTP server already started");
+        ESP_LOGI(TAG, "HTTP服务已启动，跳过重复启动");
         return server;
     }
 
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.max_uri_handlers = 36;
     config.stack_size = 8192;
+    config.recv_wait_timeout = 30;
+    config.send_wait_timeout = 30;
     config.uri_match_fn = httpd_uri_match_wildcard;
     if (httpd_start(&server, &config) == ESP_OK) {
         register_route(server, &status_uri);
@@ -2911,7 +3445,7 @@ static httpd_handle_t start_webserver(void)
         register_route(server, &apikey_post_uri);
         register_route(server, &api_config_apikey_post_uri);
         register_route(server, &options_all_uri);
-        ESP_LOGI(TAG, "HTTP server started");
+        ESP_LOGI(TAG, "HTTP服务已启动");
         return server;
     }
     server = NULL;
@@ -2924,7 +3458,7 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base, int32_t e
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
         esp_wifi_connect();
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
-        ESP_LOGW(TAG, "WiFi disconnected, reconnecting...");
+        ESP_LOGW(TAG, "WiFi已断开，准备重连...");
         otakulink_system_on_wifi_disconnected();
         esp_wifi_connect();
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
@@ -2933,8 +3467,9 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base, int32_t e
         dns.ip.u_addr.ip4.addr = ipaddr_addr("114.114.114.114");
         dns.ip.type = IPADDR_TYPE_V4;
         esp_netif_set_dns_info(netif, ESP_NETIF_DNS_MAIN, &dns);
-        ESP_LOGI(TAG, "WiFi 已就绪，启动服务...");
+        ESP_LOGI(TAG, "WiFi已就绪，启动服务...");
         otakulink_system_on_wifi_got_ip();
+        start_time_sync_if_needed();
         start_webserver();
         request_ai_start();
     }
@@ -2949,6 +3484,14 @@ void app_main(void)
 
     nvs_flash_init();
     load_runtime_config();
+
+    if (esp_ai_ui_init() == ESP_OK) {
+        s_ui_ready = true;
+        show_boot_status_screen("Starting...", "Waiting for network");
+    } else {
+        ESP_LOGE(TAG, "[显示] UI初始化失败，屏幕功能不可用");
+    }
+
     esp_netif_init();
     esp_event_loop_create_default();
     esp_netif_create_default_wifi_sta();
@@ -2963,63 +3506,44 @@ void app_main(void)
     strlcpy((char *)wifi_config.sta.password, s_wifi_password, sizeof(wifi_config.sta.password));
     esp_wifi_set_mode(WIFI_MODE_STA);
     esp_wifi_set_config(WIFI_IF_STA, &wifi_config);
+    show_boot_status_screen("Connecting WiFi", "BLE is available");
     esp_wifi_start();
     ble_start_service();
 
     // 初始化 SD 卡
     if (esp_ai_sd_init() == ESP_OK) {
-        ESP_LOGI("MAIN", "SD Card initialized successfully!");
+        ESP_LOGI("MAIN", "SD卡初始化成功");
         // 简单读取一下目录里的文件看看
                 DIR* dir = opendir("/sdcard");
         if (dir != NULL) {
             struct dirent* ent;
             while ((ent = readdir(dir)) != NULL) {
-                ESP_LOGI("MAIN", "Found file: %s", ent->d_name);
+                ESP_LOGI("MAIN", "发现文件: %s", ent->d_name);
             }
             closedir(dir);
         }
         
-        ESP_LOGI("MAIN", "--- Listing /sdcard/upload ---");
+        ESP_LOGI("MAIN", "--- 正在列出 /sdcard/upload ---");
         DIR* udir = opendir("/sdcard/upload");
         if (udir != NULL) {
             struct dirent* ent;
             while ((ent = readdir(udir)) != NULL) {
-                ESP_LOGI("MAIN", "Upload file: %s", ent->d_name);
+                ESP_LOGI("MAIN", "上传目录文件: %s", ent->d_name);
             }
             closedir(udir);
         }
     } else {
-        ESP_LOGE("MAIN", "Failed to initialize SD Card.");
+        ESP_LOGE("MAIN", "SD卡初始化失败");
     }
 
-    // 1. 优先启动图形交互引擎 (给屏幕逻辑供电)
-    esp_ai_ui_init();
-
-    // 设置背景为黑色
-    lv_obj_set_style_bg_color(lv_scr_act(), lv_color_hex(0x000000), LV_PART_MAIN);
-
-    // 当前 IDF 版先走自定义 BMP 解码路径；JPG/PNG 不能直接交给 LVGL 显示。
-    struct stat st;
-    if (stat("/sdcard/upload/photo.bmp", &st) == 0) {
-        ESP_LOGI("MAIN", "Loading BMP image from SD: /sdcard/upload/photo.bmp size=%ld", (long)st.st_size);
-        esp_ai_ui_show_bmp_file("/sdcard/upload/photo.bmp");
-    } else if (stat("/sdcard/upload/photo.jpg", &st) == 0) {
-        ESP_LOGI("MAIN", "Loading JPG image from SD: /sdcard/upload/photo.jpg size=%ld", (long)st.st_size);
-        esp_ai_ui_show_jpeg_file("/sdcard/upload/photo.jpg");
-    } else if (stat("/sdcard/upload/photo.png", &st) == 0) {
-        ESP_LOGI("MAIN", "Loading PNG image from SD: /sdcard/upload/photo.png size=%ld", (long)st.st_size);
-        esp_ai_ui_show_png_file("/sdcard/upload/photo.png");
-    } else if (stat("/sdcard/01.BMP", &st) == 0) {
-        ESP_LOGI("MAIN", "Fallback to BMP: /sdcard/01.BMP size=%ld", (long)st.st_size);
-        esp_ai_ui_show_bmp_file("/sdcard/01.BMP");
-    } else {
-        ESP_LOGW("MAIN", "No supported boot image found on SD");
-    }
+    show_startup_image_or_status();
 
     while(1) {
         lv_tick_inc(10);
+        poll_time_sync();
         poll_screensaver_state();
         otakulink_reminder_tick();
+        process_restore_last_display();
         process_pending_image_show();
         lv_timer_handler(); // 驱动 LVGL 计时器
         vTaskDelay(pdMS_TO_TICKS(10));

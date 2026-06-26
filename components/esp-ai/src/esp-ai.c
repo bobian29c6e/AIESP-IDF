@@ -61,7 +61,7 @@ bool esp_ai_is_connected(void)
 
 esp_err_t esp_ai_begin(esp_ai_config_t* config)
 {
-    ESP_LOGI(TAG, "正在复现 esp-ai 库核心逻辑...");
+    ESP_LOGI(TAG, "正在启动ESP-AI核心逻辑...");
     if (config->server.volume) {
         esp_ai_set_volume(strtof(config->server.volume, NULL));
     }

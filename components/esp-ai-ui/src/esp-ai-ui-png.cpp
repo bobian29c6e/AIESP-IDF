@@ -170,7 +170,7 @@ static void png_draw_cb(PNGDRAW *pDraw)
 {
     if (!s_active_png || !s_screen || !s_line || !pDraw) return;
     if (!png_line_to_lvcolor(pDraw, s_line, PNG_MAX_LINE_PIXELS)) {
-        ESP_LOGW(TAG, "line convert failed y=%d width=%d type=%d bpp=%d",
+        ESP_LOGW(TAG, "PNG行转换失败 y=%d 宽=%d 类型=%d bpp=%d",
                  pDraw->y, pDraw->iWidth, pDraw->iPixelType, pDraw->iBpp);
         return;
     }
@@ -222,14 +222,14 @@ static void png_draw_cb(PNGDRAW *pDraw)
 extern "C" esp_err_t esp_ai_ui_show_png_file(const char *path)
 {
     if (!path || path[0] == '\0') {
-        ESP_LOGE(TAG, "PNG path is empty");
+        ESP_LOGE(TAG, "PNG路径为空");
         return ESP_ERR_INVALID_ARG;
     }
 
     void *png_mem = heap_caps_malloc(sizeof(PNG), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!png_mem) png_mem = heap_caps_malloc(sizeof(PNG), MALLOC_CAP_8BIT);
     if (!png_mem) {
-        ESP_LOGE(TAG, "No memory for PNG decoder: need=%u", (unsigned)sizeof(PNG));
+        ESP_LOGE(TAG, "PNG解码器内存不足: 需要=%u", (unsigned)sizeof(PNG));
         return ESP_ERR_NO_MEM;
     }
 
@@ -237,7 +237,7 @@ extern "C" esp_err_t esp_ai_ui_show_png_file(const char *path)
     s_active_png = png;
     int rc = png->open(path, png_open_cb, png_close_cb, png_read_cb, png_seek_cb, png_draw_cb);
     if (rc != PNG_SUCCESS) {
-        ESP_LOGE(TAG, "PNG open failed: %s rc=%d", path, rc);
+        ESP_LOGE(TAG, "打开PNG失败: %s rc=%d", path, rc);
         s_active_png = NULL;
         png->~PNG();
         free(png_mem);
@@ -247,7 +247,7 @@ extern "C" esp_err_t esp_ai_ui_show_png_file(const char *path)
     int png_w = png->getWidth();
     int png_h = png->getHeight();
     if (png_w <= 0 || png_h <= 0 || png_w > PNG_MAX_LINE_PIXELS) {
-        ESP_LOGE(TAG, "PNG size unsupported: %s %dx%d max_line=%d", path, png_w, png_h, PNG_MAX_LINE_PIXELS);
+        ESP_LOGE(TAG, "不支持的PNG尺寸: %s %dx%d 最大行宽=%d", path, png_w, png_h, PNG_MAX_LINE_PIXELS);
         png->close();
         s_active_png = NULL;
         png->~PNG();
@@ -274,7 +274,7 @@ extern "C" esp_err_t esp_ai_ui_show_png_file(const char *path)
     s_screen = (lv_color_t *)heap_caps_calloc((size_t)LCD_H_RES * LCD_V_RES, sizeof(lv_color_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     s_line = (lv_color_t *)heap_caps_malloc((size_t)PNG_MAX_LINE_PIXELS * sizeof(lv_color_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!s_screen || !s_line) {
-        ESP_LOGE(TAG, "No memory for PNG buffers: screen=%p line=%p", s_screen, s_line);
+        ESP_LOGE(TAG, "PNG缓冲内存不足: screen=%p line=%p", s_screen, s_line);
         if (s_screen) free(s_screen);
         if (s_line) free(s_line);
         s_screen = NULL;
@@ -288,7 +288,7 @@ extern "C" esp_err_t esp_ai_ui_show_png_file(const char *path)
     if (s_target_w != png_w) {
         s_scaled_line = (lv_color_t *)heap_caps_malloc((size_t)s_target_w * sizeof(lv_color_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
         if (!s_scaled_line) {
-            ESP_LOGE(TAG, "No memory for PNG scaled line: target_w=%d", s_target_w);
+            ESP_LOGE(TAG, "PNG缩放行缓冲内存不足: 目标宽=%d", s_target_w);
             free(s_screen);
             free(s_line);
             s_screen = NULL;
@@ -317,7 +317,7 @@ extern "C" esp_err_t esp_ai_ui_show_png_file(const char *path)
     }
 
     if (rc != PNG_SUCCESS) {
-        ESP_LOGE(TAG, "PNG decode failed: %s rc=%d src=%dx%d target=%dx%d", path, rc, png_w, png_h, s_target_w, s_target_h);
+        ESP_LOGE(TAG, "PNG解码失败: %s rc=%d 原图=%dx%d 目标=%dx%d", path, rc, png_w, png_h, s_target_w, s_target_h);
         if (s_screen) free(s_screen);
         s_screen = NULL;
         return ESP_FAIL;
@@ -326,7 +326,7 @@ extern "C" esp_err_t esp_ai_ui_show_png_file(const char *path)
     esp_err_t err = esp_ai_ui_show_rgb565_buffer_take(s_screen, LCD_H_RES, LCD_V_RES, path);
     s_screen = NULL;
     if (err == ESP_OK) {
-        ESP_LOGI(TAG, "PNG shown: %s src=%dx%d target=%dx%d at=%d,%d", path, png_w, png_h, s_target_w, s_target_h, s_draw_x, s_draw_y);
+        ESP_LOGI(TAG, "PNG显示完成: %s 原图=%dx%d 目标=%dx%d 位置=%d,%d", path, png_w, png_h, s_target_w, s_target_h, s_draw_x, s_draw_y);
     }
     return err;
 }

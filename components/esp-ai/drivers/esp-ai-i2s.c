@@ -56,7 +56,7 @@ esp_err_t esp_ai_i2s_mic_read(int16_t* out_buf, size_t samples_count)
         raw_buf = (int32_t *)heap_caps_malloc(samples_count * sizeof(int32_t),
                                              MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
         if (!raw_buf) {
-            ESP_LOGE(TAG, "I2S mic raw buffer alloc failed: samples=%u", (unsigned)samples_count);
+            ESP_LOGE(TAG, "I2S麦克风原始缓冲申请失败: samples=%u", (unsigned)samples_count);
             return ESP_ERR_NO_MEM;
         }
         raw_buf_samples = samples_count;

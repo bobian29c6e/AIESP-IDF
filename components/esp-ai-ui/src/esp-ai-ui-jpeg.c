@@ -31,13 +31,13 @@ static void jpeg_error_exit(j_common_ptr cinfo)
 esp_err_t esp_ai_ui_show_jpeg_file(const char *path)
 {
     if (!path || path[0] == '\0') {
-        ESP_LOGE(TAG, "JPEG path is empty");
+        ESP_LOGE(TAG, "JPEG路径为空");
         return ESP_ERR_INVALID_ARG;
     }
 
     FILE *fp = fopen(path, "rb");
     if (!fp) {
-        ESP_LOGE(TAG, "Open JPEG failed: %s", path);
+        ESP_LOGE(TAG, "打开JPEG失败: %s", path);
         return ESP_FAIL;
     }
 
@@ -53,7 +53,7 @@ esp_err_t esp_ai_ui_show_jpeg_file(const char *path)
     esp_err_t result = ESP_FAIL;
 
     if (setjmp(jerr.jump)) {
-        ESP_LOGE(TAG, "JPEG decode error: %s path=%s", jerr.message, path);
+        ESP_LOGE(TAG, "JPEG解码错误: %s 路径=%s", jerr.message, path);
         goto cleanup;
     }
 
@@ -66,7 +66,7 @@ esp_err_t esp_ai_ui_show_jpeg_file(const char *path)
     const int src_w = (int)cinfo.output_width;
     const int src_h = (int)cinfo.output_height;
     if (src_w <= 0 || src_h <= 0 || cinfo.output_components < 3) {
-        ESP_LOGE(TAG, "Unsupported JPEG output: %s %dx%d comp=%d", path, src_w, src_h, cinfo.output_components);
+        ESP_LOGE(TAG, "不支持的JPEG输出: %s %dx%d 颜色分量=%d", path, src_w, src_h, cinfo.output_components);
         result = ESP_ERR_NOT_SUPPORTED;
         goto cleanup;
     }
@@ -88,7 +88,7 @@ esp_err_t esp_ai_ui_show_jpeg_file(const char *path)
         screen = (lv_color_t *)heap_caps_malloc((size_t)LCD_H_RES * LCD_V_RES * sizeof(lv_color_t), MALLOC_CAP_8BIT);
     }
     if (!screen) {
-        ESP_LOGE(TAG, "No memory for JPEG screen buffer");
+        ESP_LOGE(TAG, "JPEG屏幕缓冲内存不足");
         result = ESP_ERR_NO_MEM;
         goto cleanup;
     }
@@ -131,7 +131,7 @@ esp_err_t esp_ai_ui_show_jpeg_file(const char *path)
     result = esp_ai_ui_show_rgb565_buffer_take(screen, LCD_H_RES, LCD_V_RES, path);
     if (result == ESP_OK) {
         screen = NULL;
-        ESP_LOGI(TAG, "JPEG shown: %s src=%dx%d target=%dx%d at=%d,%d progressive=%d",
+        ESP_LOGI(TAG, "JPEG显示完成: %s 原图=%dx%d 目标=%dx%d 位置=%d,%d 渐进=%d",
                  path, src_w, src_h, target_w, target_h, draw_x, draw_y,
                  cinfo.progressive_mode ? 1 : 0);
     }

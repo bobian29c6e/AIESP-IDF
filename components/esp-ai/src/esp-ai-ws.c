@@ -223,7 +223,7 @@ esp_err_t esp_ai_ws_send_text_raw(const char* json_str)
 
     for (int attempt = 1; attempt <= 3; ++attempt) {
         if (!esp_ai_ws_is_connected()) {
-            ESP_LOGW(TAG, ">> 文本指令发送失败: ws not connected attempt=%d", attempt);
+            ESP_LOGW(TAG, ">> 文本指令发送失败: WS未连接 attempt=%d", attempt);
             vTaskDelay(pdMS_TO_TICKS(200));
             continue;
         }
@@ -245,7 +245,7 @@ esp_err_t esp_ai_ws_send_text_raw(const char* json_str)
         vTaskDelay(pdMS_TO_TICKS(250));
     }
 
-    ESP_LOGE(TAG, ">> 文本指令发送最终失败: %s", json_str);
+    ESP_LOGE(TAG, ">> 文本指令最终发送失败: %s", json_str);
     return ESP_FAIL;
 }
 
@@ -277,9 +277,9 @@ static void websocket_event_handler(void *handler_args, esp_event_base_t base, i
             send_connected_notice();
             break;
         case WEBSOCKET_EVENT_DISCONNECTED:
-            ESP_LOGW(TAG, "WebSocket disconnected, wait for auto reconnect");
+            ESP_LOGW(TAG, "WebSocket已断开，等待自动重连");
             s_business_ready = false;
-            esp_ai_set_audio_upload_enabled(false, "ws_disconnected");
+            esp_ai_set_audio_upload_enabled(false, "WS已断开");
             esp_ai_set_iat_active(false);
             esp_ai_set_busy(false);
             break;
@@ -369,13 +369,13 @@ esp_err_t esp_ai_ws_init(esp_ai_config_t* config)
     };
 
     ESP_LOGI(TAG, "正在连接 (含业务参数): %s", final_uri);
-    ESP_LOGI(TAG, "WS启动前内存: internal=%lu largest=%lu psram=%lu",
+    ESP_LOGI(TAG, "WS启动前内存: SRAM=%lu 最大连续=%lu PSRAM=%lu",
              (unsigned long)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
              (unsigned long)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
              (unsigned long)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
     client = esp_websocket_client_init(&ws_cfg);
     if (!client) {
-        ESP_LOGE(TAG, "WebSocket init failed: internal=%lu largest=%lu psram=%lu",
+        ESP_LOGE(TAG, "WebSocket初始化失败: SRAM=%lu 最大连续=%lu PSRAM=%lu",
                  (unsigned long)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
                  (unsigned long)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
                  (unsigned long)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
@@ -384,7 +384,7 @@ esp_err_t esp_ai_ws_init(esp_ai_config_t* config)
     esp_websocket_register_events(client, WEBSOCKET_EVENT_ANY, websocket_event_handler, (void *)config);
     esp_err_t ret = esp_websocket_client_start(client);
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "WebSocket start failed: %s internal=%lu largest=%lu psram=%lu",
+        ESP_LOGE(TAG, "WebSocket启动失败: %s SRAM=%lu 最大连续=%lu PSRAM=%lu",
                  esp_err_to_name(ret),
                  (unsigned long)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
                  (unsigned long)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),

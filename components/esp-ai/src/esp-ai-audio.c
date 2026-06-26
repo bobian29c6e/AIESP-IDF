@@ -49,7 +49,7 @@ static void audio_playback_task(void *pvParameters)
                                                    MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
 
     if (!hMP3Decoder || !pcm_buf) {
-        ESP_LOGE(TAG, "MP3 playback init failed: decoder=%p pcm=%p internal=%lu psram=%lu",
+        ESP_LOGE(TAG, "MP3播放初始化失败: 解码器=%p PCM=%p SRAM=%lu PSRAM=%lu",
                  hMP3Decoder,
                  pcm_buf,
                  (unsigned long)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
@@ -60,7 +60,7 @@ static void audio_playback_task(void *pvParameters)
         return;
     }
 
-    ESP_LOGI(TAG, "Helix MP3 解码泵已启动...");
+    ESP_LOGI(TAG, "MP3解码播放任务已启动");
 
     while (1) {
         size_t item_size;
@@ -82,7 +82,7 @@ static void audio_playback_task(void *pvParameters)
                 if (err == ERR_MP3_NONE) {
                     MP3GetLastFrameInfo(hMP3Decoder, &mp3FrameInfo);
                     if (mp3FrameInfo.outputSamps <= 0 || mp3FrameInfo.outputSamps > MP3_PCM_MAX_SAMPLES) {
-                        ESP_LOGW(TAG, "Drop invalid MP3 frame outputSamps=%d max=%d bytesLeft=%d",
+                        ESP_LOGW(TAG, "丢弃异常MP3帧 outputSamps=%d max=%d bytesLeft=%d",
                                  mp3FrameInfo.outputSamps, MP3_PCM_MAX_SAMPLES, bytes_left);
                         continue;
                     }
@@ -142,14 +142,14 @@ static void audio_flow_control_task(void *pvParameters)
                 } else if (s_audio_busy_seen) {
                     s_audio_full_ticks++;
                     if (s_audio_full_ticks >= 3) {
-                        ESP_LOGI(TAG, "Audio buffer drained, mark session idle");
+                        ESP_LOGI(TAG, "音频缓冲已播放完，标记会话空闲");
                         esp_ai_set_busy(false);
                         s_audio_busy_seen = false;
                         s_audio_full_ticks = 0;
                         s_audio_busy_started_at = 0;
                     }
                 } else if ((now - s_audio_busy_started_at) > 10000000LL) {
-                    ESP_LOGW(TAG, "Audio busy timeout without buffered audio, mark session idle");
+                    ESP_LOGW(TAG, "音频忙碌超时且无缓冲音频，标记会话空闲");
                     esp_ai_set_busy(false);
                     s_audio_full_ticks = 0;
                     s_audio_busy_started_at = 0;
@@ -169,7 +169,7 @@ void esp_ai_audio_ingest_bin(const uint8_t* data, size_t len)
 {
     if (audio_rb) {
         if (xRingbufferSend(audio_rb, data, len, pdMS_TO_TICKS(100)) != pdTRUE) {
-            ESP_LOGW(TAG, "Audio buffer full/drop len=%u free=%u", (unsigned)len, (unsigned)xRingbufferGetCurFreeSize(audio_rb));
+            ESP_LOGW(TAG, "音频缓冲已满，丢弃数据 len=%u free=%u", (unsigned)len, (unsigned)xRingbufferGetCurFreeSize(audio_rb));
         }
     }
 }
@@ -180,7 +180,7 @@ static void audio_uplink_task(void *pvParameters)
     const size_t samples_per_frame = 512;
     int16_t *pcm_buf = (int16_t *)heap_caps_malloc(samples_per_frame * sizeof(int16_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     if (!pcm_buf) {
-        ESP_LOGE(TAG, "Audio uplink pcm buffer alloc failed");
+        ESP_LOGE(TAG, "音频上行PCM缓冲申请失败");
         vTaskDelete(NULL);
         return;
     }
@@ -198,24 +198,24 @@ static void audio_uplink_task(void *pvParameters)
 
 void esp_ai_audio_init(void)
 {
-    ESP_LOGI(TAG, "Audio init before alloc: internal=%lu largest=%lu psram=%lu",
+    ESP_LOGI(TAG, "音频初始化前内存: SRAM=%lu 最大连续=%lu PSRAM=%lu",
              (unsigned long)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
              (unsigned long)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
              (unsigned long)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
 
     audio_rb = xRingbufferCreateWithCaps(AUDIO_BUFFER_SIZE, RINGBUF_TYPE_BYTEBUF, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (audio_rb == NULL) {
-        ESP_LOGW(TAG, "PSRAM audio ringbuffer failed, fallback to internal 40KB");
+        ESP_LOGW(TAG, "PSRAM音频环形缓冲申请失败，回退到内部SRAM 40KB");
         audio_rb = xRingbufferCreate(1024 * 40, RINGBUF_TYPE_BYTEBUF);
     }
     BaseType_t uplink_ok = xTaskCreateWithCaps(audio_uplink_task, "ai_uplink_task", 4096, NULL, 5, NULL, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (uplink_ok != pdPASS) {
-        ESP_LOGW(TAG, "PSRAM uplink task stack failed, fallback to internal");
+        ESP_LOGW(TAG, "PSRAM上行任务栈申请失败，回退到内部SRAM");
         xTaskCreate(audio_uplink_task, "ai_uplink_task", 4096, NULL, 5, NULL);
     }
     BaseType_t flow_ok = xTaskCreateWithCaps(audio_flow_control_task, "ai_flow_task", 3072, NULL, 4, NULL, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (flow_ok != pdPASS) {
-        ESP_LOGW(TAG, "PSRAM flow task stack failed, fallback to internal");
+        ESP_LOGW(TAG, "PSRAM流控任务栈申请失败，回退到内部SRAM");
         xTaskCreate(audio_flow_control_task, "ai_flow_task", 3072, NULL, 4, NULL);
     }
     xTaskCreate(audio_playback_task, "ai_spk_task", 8192, NULL, 6, NULL);

@@ -160,7 +160,7 @@ static void schedule_business_ws_reconnect_locked(int delay_ms, const char *reas
         s_state.reconnect_due_ms = due;
     }
     s_state.reconnect_pending = true;
-    ESP_LOGI(TAG, "[BWS] reconnect scheduled delay=%d reason=%s", delay_ms, reason ? reason : "unknown");
+    ESP_LOGI(TAG, "[业务WS] 已安排重连 延迟=%dms 原因=%s", delay_ms, reason ? reason : "未知");
 }
 
 static void pause_business_ws_locked(bool paused, const char *reason)
@@ -172,7 +172,7 @@ static void pause_business_ws_locked(bool paused, const char *reason)
     if (paused) {
         s_state.reconnect_pending = false;
     }
-    ESP_LOGW(TAG, "[BWS] %s reason=%s", paused ? "paused" : "resumed", reason ? reason : "unknown");
+    ESP_LOGW(TAG, "[业务WS] %s 原因=%s", paused ? "已暂停" : "已恢复", reason ? reason : "未知");
 }
 
 static void business_ws_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data)
@@ -188,7 +188,7 @@ static void business_ws_event_handler(void *handler_args, esp_event_base_t base,
         s_state.business_ws_connects++;
         s_state.reconnect_pending = false;
         unlock_state();
-        ESP_LOGI(TAG, "[BWS] connected heap=%lu max=%lu",
+        ESP_LOGI(TAG, "[业务WS] 已连接 SRAM=%lu 最大连续=%lu",
                  (unsigned long)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
                  (unsigned long)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
         if (s_business_ws_message_cb) {
@@ -202,10 +202,10 @@ static void business_ws_event_handler(void *handler_args, esp_event_base_t base,
         s_state.business_ws_started = false;
         s_state.business_ws_disconnects++;
         if (!s_state.business_ws_paused && s_state.wifi_connected) {
-            schedule_business_ws_reconnect_locked(WS_RECONNECT_DELAY_MS, "event_disconnect");
+            schedule_business_ws_reconnect_locked(WS_RECONNECT_DELAY_MS, "事件断开");
         }
         unlock_state();
-        ESP_LOGW(TAG, "[BWS] disconnected event=%ld heap=%lu max=%lu",
+        ESP_LOGW(TAG, "[业务WS] 已断开 event=%ld SRAM=%lu 最大连续=%lu",
                  (long)event_id,
                  (unsigned long)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
                  (unsigned long)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
@@ -214,14 +214,14 @@ static void business_ws_event_handler(void *handler_args, esp_event_base_t base,
         lock_state();
         s_state.business_ws_errors++;
         unlock_state();
-        ESP_LOGW(TAG, "[BWS] error type=%d errno=%d",
+        ESP_LOGW(TAG, "[业务WS] 发生错误 type=%d errno=%d",
                  data ? data->error_handle.error_type : -1,
                  data ? data->error_handle.esp_transport_sock_errno : 0);
         break;
     case WEBSOCKET_EVENT_DATA:
         if (data && data->op_code == 0x1 && data->data_ptr && data->data_len > 0) {
             int len = data->data_len > 160 ? 160 : data->data_len;
-            ESP_LOGI(TAG, "[BWS] message len=%d data=%.*s%s",
+            ESP_LOGI(TAG, "[业务WS] 收到消息 长度=%d 内容=%.*s%s",
                      data->data_len, len, data->data_ptr, data->data_len > len ? "..." : "");
             char *json_text = heap_caps_malloc(data->data_len + 1, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
             if (json_text) {
@@ -232,9 +232,9 @@ static void business_ws_event_handler(void *handler_args, esp_event_base_t base,
                 if (root && cJSON_IsString(type) && s_business_ws_message_cb) {
                     s_business_ws_message_cb(type->valuestring, root);
                 } else if (root && !cJSON_IsString(type)) {
-                    ESP_LOGW(TAG, "[BWS] message missing string type");
+                    ESP_LOGW(TAG, "[业务WS] 消息缺少字符串type字段");
                 } else if (!root) {
-                    ESP_LOGW(TAG, "[BWS] bad json message");
+                    ESP_LOGW(TAG, "[业务WS] 消息JSON解析失败");
                 }
                 if (root) cJSON_Delete(root);
                 heap_caps_free(json_text);
@@ -256,7 +256,7 @@ static void stop_business_ws(const char *reason)
     esp_websocket_client_stop(s_business_ws);
     int64_t dt = now_ms() - t0;
     if (dt > 1000) {
-        ESP_LOGW(TAG, "[BWS][DIAG] stop took %lldms reason=%s", (long long)dt, reason ? reason : "unknown");
+        ESP_LOGW(TAG, "[业务WS][诊断] 停止耗时=%lldms 原因=%s", (long long)dt, reason ? reason : "未知");
     }
 
     lock_state();
@@ -297,7 +297,7 @@ static void start_business_ws_if_needed(void)
     }
 
     if (s_business_ws) {
-        stop_business_ws("restart_before_connect");
+        stop_business_ws("重连前清理旧连接");
         esp_websocket_client_destroy(s_business_ws);
         s_business_ws = NULL;
     }
@@ -322,9 +322,9 @@ static void start_business_ws_if_needed(void)
     if (!s_business_ws) {
         lock_state();
         s_state.business_ws_errors++;
-        schedule_business_ws_reconnect_locked(WS_RECONNECT_MIN_INTERVAL_MS, "init_failed");
+        schedule_business_ws_reconnect_locked(WS_RECONNECT_MIN_INTERVAL_MS, "初始化失败");
         unlock_state();
-        ESP_LOGE(TAG, "[BWS] init failed");
+        ESP_LOGE(TAG, "[业务WS] 初始化失败");
         return;
     }
 
@@ -336,14 +336,14 @@ static void start_business_ws_if_needed(void)
     s_state.business_ws_started = true;
     unlock_state();
 
-    ESP_LOGI(TAG, "[BWS] connecting uri=%s", snap.uri);
+    ESP_LOGI(TAG, "[业务WS] 正在连接 uri=%s", snap.uri);
     esp_err_t err = esp_websocket_client_start(s_business_ws);
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "[BWS] start failed: %s", esp_err_to_name(err));
+        ESP_LOGE(TAG, "[业务WS] 启动失败: %s", esp_err_to_name(err));
         lock_state();
         s_state.business_ws_started = false;
         s_state.business_ws_errors++;
-        schedule_business_ws_reconnect_locked(WS_RECONNECT_MIN_INTERVAL_MS, "start_failed");
+        schedule_business_ws_reconnect_locked(WS_RECONNECT_MIN_INTERVAL_MS, "启动失败");
         unlock_state();
     }
 }
@@ -351,14 +351,14 @@ static void start_business_ws_if_needed(void)
 static void wifi_reset_task(void *arg)
 {
     const char *reason = (const char *)arg;
-    ESP_LOGW(TAG, "[NET] resetting WiFi stack reason=%s", reason ? reason : "unknown");
-    stop_business_ws("wifi_reset");
+    ESP_LOGW(TAG, "[网络] 正在重置WiFi网络栈 原因=%s", reason ? reason : "未知");
+    stop_business_ws("WiFi重置");
     esp_wifi_disconnect();
     vTaskDelay(pdMS_TO_TICKS(300));
     esp_wifi_stop();
     vTaskDelay(pdMS_TO_TICKS(700));
     esp_wifi_start();
-    ESP_LOGW(TAG, "[NET] WiFi stack reset requested start done reason=%s", reason ? reason : "unknown");
+    ESP_LOGW(TAG, "[网络] WiFi网络栈重置已请求，正在重新启动 原因=%s", reason ? reason : "未知");
     vTaskDelete(NULL);
 }
 
@@ -367,7 +367,7 @@ static void request_wifi_stack_reset(const char *reason)
     int64_t now = now_ms();
     lock_state();
     if (now - s_state.last_wifi_reset_ms < WIFI_RESET_MIN_INTERVAL_MS) {
-        ESP_LOGW(TAG, "[NET] WiFi reset throttled reason=%s", reason ? reason : "unknown");
+        ESP_LOGW(TAG, "[网络] WiFi重置过于频繁，已跳过 原因=%s", reason ? reason : "未知");
         unlock_state();
         return;
     }
@@ -403,13 +403,13 @@ static void handle_low_memory_guard(void)
         bool recovered = heap_now > RECOVERY_HEAP_BYTES && max_now > RECOVERY_MAX_BYTES;
         bool fallback = (now - s_state.recovery_started_ms > RECOVERY_FALLBACK_MS) && heap_now > RISK_HEAP_BYTES;
         if (recovered || fallback) {
-            ESP_LOGW(TAG, "[RISK] recovered heap=%lu max=%lu mode=%s",
-                     (unsigned long)heap_now, (unsigned long)max_now, recovered ? "full" : "fallback");
+            ESP_LOGW(TAG, "[风险保护] 内存已恢复 SRAM=%lu 最大连续=%lu 模式=%s",
+                     (unsigned long)heap_now, (unsigned long)max_now, recovered ? "完全恢复" : "兜底恢复");
             s_state.network_recovery_active = false;
             s_state.risk_active = false;
             s_state.low_mem_since_ms = 0;
-            pause_business_ws_locked(false, "risk_recovered");
-            schedule_business_ws_reconnect_locked(WS_RECONNECT_DELAY_MS, "risk_recovered");
+            pause_business_ws_locked(false, "风险已恢复");
+            schedule_business_ws_reconnect_locked(WS_RECONNECT_DELAY_MS, "风险已恢复");
             unlock_state();
             return;
         }
@@ -418,11 +418,11 @@ static void handle_low_memory_guard(void)
     if (!risk) {
         s_state.low_mem_since_ms = 0;
         if (s_state.risk_active && !s_state.network_recovery_active) {
-            ESP_LOGW(TAG, "[RISK] upload/memory risk cleared heap=%lu max=%lu",
+            ESP_LOGW(TAG, "[风险保护] 上传/内存风险已解除 SRAM=%lu 最大连续=%lu",
                      (unsigned long)heap_now, (unsigned long)max_now);
             s_state.risk_active = false;
-            pause_business_ws_locked(false, "risk_cleared");
-            schedule_business_ws_reconnect_locked(WS_RECONNECT_DELAY_MS, "risk_cleared");
+            pause_business_ws_locked(false, "风险已解除");
+            schedule_business_ws_reconnect_locked(WS_RECONNECT_DELAY_MS, "风险已解除");
         }
         unlock_state();
         return;
@@ -433,7 +433,7 @@ static void handle_low_memory_guard(void)
     }
     int64_t risk_for = now - s_state.low_mem_since_ms;
     if (risk_for == 0 || risk_for % 5000 < SYSTEM_TASK_PERIOD_MS) {
-        ESP_LOGW(TAG, "[RISK] heap=%lu max=%lu riskFor=%lldms critical=%d pressure=%d upload=%d ai=%d recovery=%d",
+        ESP_LOGW(TAG, "[风险保护] SRAM=%lu 最大连续=%lu 持续=%lldms 严重=%d 压力=%d 上传=%d AI=%d 恢复中=%d",
                  (unsigned long)heap_now,
                  (unsigned long)max_now,
                  (long long)risk_for,
@@ -447,37 +447,37 @@ static void handle_low_memory_guard(void)
     if (!s_state.network_recovery_active && risk_for > LOW_MEM_HOLD_MS) {
         s_state.low_mem_events++;
         if (upload) {
-            ESP_LOGW(TAG, "[RISK] upload active: pause business WS, skip WiFi reset heap=%lu max=%lu",
+            ESP_LOGW(TAG, "[风险保护] 上传中：暂停业务WS，跳过WiFi重置 SRAM=%lu 最大连续=%lu",
                      (unsigned long)heap_now, (unsigned long)max_now);
-            pause_business_ws_locked(true, "upload_low_mem");
+            pause_business_ws_locked(true, "上传期间内存偏低");
             s_state.business_ws_connected = false;
             s_state.risk_active = true;
             s_state.low_mem_since_ms = now;
             unlock_state();
-            stop_business_ws("upload_low_mem");
+            stop_business_ws("上传期间内存偏低");
             return;
         }
         if (ai_active && !critical) {
-            ESP_LOGW(TAG, "[RISK] AI busy: pause business WS, defer WiFi reset heap=%lu max=%lu",
+            ESP_LOGW(TAG, "[风险保护] AI忙碌中：暂停业务WS，暂缓WiFi重置 SRAM=%lu 最大连续=%lu",
                      (unsigned long)heap_now, (unsigned long)max_now);
-            pause_business_ws_locked(true, "ai_busy_low_mem");
+            pause_business_ws_locked(true, "AI忙碌期间内存偏低");
             s_state.business_ws_connected = false;
             s_state.risk_active = true;
             s_state.low_mem_since_ms = now;
             unlock_state();
-            stop_business_ws("ai_busy_low_mem");
+            stop_business_ws("AI忙碌期间内存偏低");
             return;
         }
 
-        ESP_LOGW(TAG, "[RISK] low memory persisted: pause business WS and reset WiFi stack");
-        pause_business_ws_locked(true, "low_mem_guard");
+        ESP_LOGW(TAG, "[风险保护] 低内存持续存在：暂停业务WS并重置WiFi网络栈");
+        pause_business_ws_locked(true, "低内存保护");
         s_state.business_ws_connected = false;
         s_state.network_recovery_active = true;
         s_state.risk_active = true;
         s_state.recovery_started_ms = now;
         unlock_state();
-        stop_business_ws("low_mem_guard");
-        request_wifi_stack_reset("low_mem_guard");
+        stop_business_ws("低内存保护");
+        request_wifi_stack_reset("低内存保护");
         return;
     }
     unlock_state();
@@ -498,7 +498,7 @@ static void handle_ai_activity_pause(void)
     lock_state();
     if (active && !s_state.ai_pause_active) {
         s_state.ai_pause_active = true;
-        pause_business_ws_locked(true, esp_ai_get_upload_active() ? "upload_active" : "ai_busy");
+        pause_business_ws_locked(true, esp_ai_get_upload_active() ? "上传中" : "AI忙碌");
         s_state.business_ws_connected = false;
         should_stop = true;
     } else if (active && s_state.business_ws_paused &&
@@ -508,9 +508,9 @@ static void handle_ai_activity_pause(void)
     } else if (!active && s_state.ai_pause_active) {
         s_state.ai_pause_active = false;
         if (!s_state.network_recovery_active && !s_state.risk_active) {
-            pause_business_ws_locked(false, "ai_idle");
+            pause_business_ws_locked(false, "AI空闲");
             if (s_state.wifi_connected) {
-                schedule_business_ws_reconnect_locked(WS_RECONNECT_DELAY_MS, "ai_idle");
+                schedule_business_ws_reconnect_locked(WS_RECONNECT_DELAY_MS, "AI空闲");
             }
             should_resume = true;
         }
@@ -521,7 +521,7 @@ static void handle_ai_activity_pause(void)
         stop_business_ws("ai_or_upload_active");
     }
     if (should_resume) {
-        ESP_LOGI(TAG, "[BWS] AI/upload idle, business WS may reconnect");
+        ESP_LOGI(TAG, "[业务WS] AI/上传已空闲，允许业务WS重连");
     }
 }
 
@@ -539,7 +539,7 @@ static void log_health_if_due(void)
     unlock_state();
 
     ESP_LOGI(TAG,
-             "[HEALTH] heap=%lu min=%lu max=%lu psram=%lu rssi=%d wifi=%d ai=%d busy=%d bws=%d paused=%d upload=%d recovery=%d wifiDisc=%lu wifiReset=%lu bwsConn=%lu bwsDisc=%lu bwsErr=%lu lowMem=%lu",
+             "[健康] SRAM=%lu 最低SRAM=%lu 最大连续=%lu PSRAM=%lu WiFi信号=%d WiFi=%d AI=%d 忙碌=%d 业务WS=%d 暂停=%d 上传=%d 恢复中=%d WiFi断开=%lu WiFi重置=%lu 业务WS连接=%lu 业务WS断开=%lu 业务WS错误=%lu 低内存=%lu",
              (unsigned long)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
              (unsigned long)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL),
              (unsigned long)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
@@ -605,7 +605,7 @@ esp_err_t otakulink_business_ws_send_text(const char *text)
 
     int sent = esp_websocket_client_send_text(s_business_ws, text, strlen(text), pdMS_TO_TICKS(1000));
     if (sent < 0) {
-        ESP_LOGW(TAG, "[BWS] send failed len=%u", (unsigned)strlen(text));
+        ESP_LOGW(TAG, "[业务WS] 发送失败 长度=%u", (unsigned)strlen(text));
         return ESP_FAIL;
     }
     return ESP_OK;
@@ -614,7 +614,7 @@ esp_err_t otakulink_business_ws_send_text(const char *text)
 void otakulink_system_set_business_ws_config(const otakulink_business_ws_config_t *config)
 {
     if (!config || !config->device_id || !config->api_key || config->api_key[0] == '\0') {
-        ESP_LOGW(TAG, "[BWS] config ignored: missing device_id/api_key");
+        ESP_LOGW(TAG, "[业务WS] 配置已忽略：缺少device_id或api_key");
         return;
     }
 
@@ -623,10 +623,10 @@ void otakulink_system_set_business_ws_config(const otakulink_business_ws_config_
 
     lock_state();
     strlcpy(s_state.uri, uri, sizeof(s_state.uri));
-    schedule_business_ws_reconnect_locked(WS_RECONNECT_DELAY_MS, "config_updated");
+    schedule_business_ws_reconnect_locked(WS_RECONNECT_DELAY_MS, "配置已更新");
     unlock_state();
 
-    ESP_LOGI(TAG, "[BWS] config updated device=%s key=%.4s****",
+    ESP_LOGI(TAG, "[业务WS] 配置已更新 设备=%s key=%.4s****",
              config->device_id, config->api_key);
 }
 
@@ -640,11 +640,11 @@ void otakulink_system_on_wifi_got_ip(void)
             s_state.network_recovery_active = false;
             s_state.risk_active = false;
             s_state.low_mem_since_ms = 0;
-            pause_business_ws_locked(false, "wifi_recovered");
+            pause_business_ws_locked(false, "WiFi已恢复");
         }
     }
     if (!s_state.business_ws_paused) {
-        schedule_business_ws_reconnect_locked(WS_RECONNECT_DELAY_MS, "wifi_got_ip");
+        schedule_business_ws_reconnect_locked(WS_RECONNECT_DELAY_MS, "WiFi获取IP");
     }
     unlock_state();
 }
@@ -666,7 +666,7 @@ void otakulink_system_pause_business_ws_for_ai(const char *reason)
     s_state.ai_pause_active = true;
     s_state.ai_pause_until_ms = now_ms() + AI_WS_PAUSE_HOLD_MS;
     if (!s_state.business_ws_paused) {
-        pause_business_ws_locked(true, reason ? reason : "ai_activity");
+        pause_business_ws_locked(true, reason ? reason : "AI活动");
     }
     if (s_state.business_ws_started || s_state.business_ws_connected) {
         should_stop = true;
@@ -675,7 +675,7 @@ void otakulink_system_pause_business_ws_for_ai(const char *reason)
     unlock_state();
 
     if (should_stop) {
-        stop_business_ws(reason ? reason : "ai_activity");
+        stop_business_ws(reason ? reason : "AI活动");
     }
 }
 
