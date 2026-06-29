@@ -99,6 +99,7 @@ static void remember_last_display(const char *fs_path, const char *lv_src);
 static bool find_preferred_startup_image(char *fs_path, size_t fs_len, char *lv_src, size_t lv_len);
 static void show_startup_image_or_status(void);
 static esp_err_t show_uploaded_image_now(const char *fs_path, const char *lv_src);
+static bool request_show_uploaded_image(const char *fs_path, const char *lv_src);
 
 static const char s_default_api_key[] = "";
 static const char s_default_volume[] = "0.7";
@@ -709,18 +710,20 @@ static void show_startup_image_or_status(void)
     }
 }
 
-static void request_show_uploaded_image(const char *fs_path, const char *lv_src)
+static bool request_show_uploaded_image(const char *fs_path, const char *lv_src)
 {
     if (!s_pending_show_mutex || !fs_path || !lv_src) {
-        return;
+        return false;
     }
     if (xSemaphoreTake(s_pending_show_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
         strlcpy(s_pending_show_fs_path, fs_path, sizeof(s_pending_show_fs_path));
         strlcpy(s_pending_show_lv_src, lv_src, sizeof(s_pending_show_lv_src));
         s_pending_show = true;
         xSemaphoreGive(s_pending_show_mutex);
+        return true;
     } else {
         ESP_LOGW(TAG, "等待图片显示锁超时");
+        return false;
     }
 }
 
@@ -750,6 +753,10 @@ static void process_pending_image_show(void)
             remember_last_display(fs_path, lv_src);
         }
         ESP_LOGI(TAG, "异步图片显示结束: %s 结果=%s", fs_path, esp_err_to_name(err));
+        if (esp_ai_get_upload_active()) {
+            esp_ai_set_upload_active(false);
+            ESP_LOGI(TAG, "[上传] 图片显示结束，允许业务WS恢复");
+        }
     }
 }
 
@@ -1636,7 +1643,7 @@ static void set_cors_headers(httpd_req_t *req)
 {
     httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
     httpd_resp_set_hdr(req, "Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-    httpd_resp_set_hdr(req, "Access-Control-Allow-Headers", "Content-Type");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Headers", "Content-Type, X-Filename, X-File-Name");
 }
 
 static esp_err_t options_handler(httpd_req_t *req)
@@ -2031,6 +2038,41 @@ static bool parse_multipart_file_part(const uint8_t *body, size_t body_len,
 static const int64_t UPLOAD_RECV_IDLE_TIMEOUT_MS = 90000;
 static const int64_t UPLOAD_RECV_TOTAL_TIMEOUT_MS = 300000;
 
+typedef struct {
+    bool changed;
+    wifi_ps_type_t previous_mode;
+} upload_wifi_ps_guard_t;
+
+/* Uploads are short and benefit from consistent WiFi scheduling. */
+static void upload_wifi_performance_begin(upload_wifi_ps_guard_t *guard)
+{
+    memset(guard, 0, sizeof(*guard));
+    if (esp_wifi_get_ps(&guard->previous_mode) != ESP_OK) {
+        ESP_LOGW(TAG, "[上传] 无法读取WiFi省电模式，保持当前模式");
+        return;
+    }
+    if (guard->previous_mode == WIFI_PS_NONE) {
+        ESP_LOGI(TAG, "[上传] WiFi已处于全速模式");
+        return;
+    }
+    if (esp_wifi_set_ps(WIFI_PS_NONE) == ESP_OK) {
+        guard->changed = true;
+        ESP_LOGI(TAG, "[上传] WiFi已切换为全速模式");
+    } else {
+        ESP_LOGW(TAG, "[上传] WiFi切换全速模式失败，保持当前模式");
+    }
+}
+
+static void upload_wifi_performance_end(const upload_wifi_ps_guard_t *guard)
+{
+    if (!guard->changed) return;
+    if (esp_wifi_set_ps(guard->previous_mode) == ESP_OK) {
+        ESP_LOGI(TAG, "[上传] WiFi已恢复原省电模式");
+    } else {
+        ESP_LOGW(TAG, "[上传] WiFi恢复原省电模式失败");
+    }
+}
+
 static bool extract_quoted_value(const char *src, const char *key, char *out, size_t out_len)
 {
     const char *p = strstr(src, key);
@@ -2173,11 +2215,46 @@ typedef struct {
     size_t marker_len;
     uint8_t *work;
     size_t work_cap;
+    uint8_t *write_buf;
+    size_t write_buf_cap;
+    size_t write_buf_used;
     uint8_t tail[160];
     size_t tail_len;
     size_t file_len;
+    uint32_t write_calls;
+    int64_t write_elapsed_us;
     bool found_end;
 } upload_stream_state_t;
+
+static esp_err_t upload_stream_flush(upload_stream_state_t *st)
+{
+    if (st->write_buf_used == 0) return ESP_OK;
+    int64_t started = esp_timer_get_time();
+    if (write_all_fd(st->fd, st->write_buf, st->write_buf_used) != ESP_OK) {
+        return ESP_FAIL;
+    }
+    st->write_elapsed_us += esp_timer_get_time() - started;
+    st->file_len += st->write_buf_used;
+    st->write_buf_used = 0;
+    ++st->write_calls;
+    return ESP_OK;
+}
+
+static esp_err_t upload_stream_queue_file_bytes(upload_stream_state_t *st, const uint8_t *data, size_t len)
+{
+    while (len > 0) {
+        size_t available = st->write_buf_cap - st->write_buf_used;
+        size_t copy_len = len < available ? len : available;
+        memcpy(st->write_buf + st->write_buf_used, data, copy_len);
+        st->write_buf_used += copy_len;
+        data += copy_len;
+        len -= copy_len;
+        if (st->write_buf_used == st->write_buf_cap && upload_stream_flush(st) != ESP_OK) {
+            return ESP_FAIL;
+        }
+    }
+    return ESP_OK;
+}
 
 static esp_err_t upload_stream_write_file_bytes(upload_stream_state_t *st, const uint8_t *data, size_t len)
 {
@@ -2193,20 +2270,19 @@ static esp_err_t upload_stream_write_file_bytes(upload_stream_state_t *st, const
     const uint8_t *end = find_bytes(st->work, work_len, st->marker, st->marker_len);
     if (end) {
         size_t write_len = (size_t)(end - st->work);
-        if (write_len > 0 && write_all_fd(st->fd, st->work, write_len) != ESP_OK) {
+        if (write_len > 0 && upload_stream_queue_file_bytes(st, st->work, write_len) != ESP_OK) {
             return ESP_FAIL;
         }
-        st->file_len += write_len;
+        if (upload_stream_flush(st) != ESP_OK) return ESP_FAIL;
         st->found_end = true;
         return ESP_OK;
     }
 
     if (work_len > st->marker_len) {
         size_t write_len = work_len - st->marker_len;
-        if (write_all_fd(st->fd, st->work, write_len) != ESP_OK) {
+        if (upload_stream_queue_file_bytes(st, st->work, write_len) != ESP_OK) {
             return ESP_FAIL;
         }
-        st->file_len += write_len;
         memcpy(st->tail, st->work + write_len, st->marker_len);
         st->tail_len = st->marker_len;
     } else if (work_len > 0) {
@@ -2233,6 +2309,236 @@ static esp_err_t drain_upload_remainder(httpd_req_t *req, uint8_t *rx, size_t rx
         return ESP_FAIL;
     }
     return ESP_OK;
+}
+
+static bool get_upload_filename_from_request(httpd_req_t *req, char *filename, size_t filename_len)
+{
+    if (!filename || filename_len == 0) return false;
+    filename[0] = '\0';
+
+    if (get_query_value(req, "filename", filename, filename_len) && filename[0] != '\0') {
+        return true;
+    }
+    if (get_query_value(req, "name", filename, filename_len) && filename[0] != '\0') {
+        return true;
+    }
+    if (httpd_req_get_hdr_value_str(req, "X-Filename", filename, filename_len) == ESP_OK && filename[0] != '\0') {
+        return true;
+    }
+    if (httpd_req_get_hdr_value_str(req, "X-File-Name", filename, filename_len) == ESP_OK && filename[0] != '\0') {
+        return true;
+    }
+    return false;
+}
+
+static esp_err_t stream_raw_upload_to_sd(httpd_req_t *req,
+                                         const char *content_type,
+                                         const char *filename,
+                                         int64_t started,
+                                         char *final_path,
+                                         size_t final_path_len,
+                                         char *lv_src,
+                                         size_t lv_src_len,
+                                         size_t *out_file_len,
+                                         const char **out_error,
+                                         int *out_status_code)
+{
+    const size_t rx_size = 8192;
+    size_t write_buf_cap = 16 * 1024;
+    uint8_t *rx = (uint8_t *)heap_caps_malloc(rx_size, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    uint8_t *write_buf = (uint8_t *)heap_caps_malloc(write_buf_cap,
+                                                      MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT | MALLOC_CAP_DMA);
+    if (!write_buf) {
+        write_buf_cap = 4 * 1024;
+        write_buf = (uint8_t *)heap_caps_malloc(write_buf_cap,
+                                                 MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT | MALLOC_CAP_DMA);
+    }
+    if (!rx || !write_buf) {
+        if (rx) heap_caps_free(rx);
+        if (write_buf) heap_caps_free(write_buf);
+        *out_status_code = 500;
+        *out_error = "NO_MEMORY";
+        return ESP_FAIL;
+    }
+
+    mkdir("/sdcard/upload", 0775);
+    mkdir("/sdcard/gif", 0775);
+
+    const char *kind = detect_upload_kind(filename, content_type);
+    char tmp_path[96] = {0};
+    int fd = -1;
+    upload_stream_state_t st = {
+        .fd = -1,
+        .write_buf = write_buf,
+        .write_buf_cap = write_buf_cap,
+    };
+
+    size_t received = 0;
+    size_t recv_min = SIZE_MAX;
+    size_t recv_max = 0;
+    uint32_t recv_calls = 0;
+    uint32_t recv_timeouts = 0;
+    int64_t recv_wait_us = 0;
+    int64_t recv_wait_max_us = 0;
+    int64_t last_data = started;
+    int64_t write_started = 0;
+    int64_t before_close = 0;
+    esp_err_t result = ESP_FAIL;
+
+    if (kind) {
+        build_upload_paths(kind, final_path, final_path_len, lv_src, lv_src_len, tmp_path, sizeof(tmp_path));
+        unlink(tmp_path);
+        fd = open(tmp_path, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+        if (fd < 0) {
+            *out_status_code = 500;
+            *out_error = "SAVE_FAILED";
+            goto cleanup;
+        }
+        st.fd = fd;
+        write_started = esp_timer_get_time();
+        ESP_LOGI(TAG, "[上传] raw直传已识别格式=%s 文件名=%s 类型=%s 保存到=%s",
+                 kind,
+                 filename && filename[0] ? filename : "(none)",
+                 content_type && content_type[0] ? content_type : "(none)",
+                 final_path);
+    }
+
+    while (received < req->content_len) {
+        size_t to_read = req->content_len - received;
+        if (to_read > rx_size) to_read = rx_size;
+        int64_t recv_started = esp_timer_get_time();
+        int ret = httpd_req_recv(req, (char *)rx, to_read);
+        int64_t now = esp_timer_get_time();
+        int64_t recv_elapsed_us = now - recv_started;
+        recv_wait_us += recv_elapsed_us;
+        if (recv_elapsed_us > recv_wait_max_us) recv_wait_max_us = recv_elapsed_us;
+
+        if (ret <= 0) {
+            if (ret == HTTPD_SOCK_ERR_TIMEOUT) {
+                ++recv_timeouts;
+                int64_t idle_ms = (now - last_data) / 1000;
+                int64_t total_ms = (now - started) / 1000;
+                if (idle_ms > UPLOAD_RECV_IDLE_TIMEOUT_MS || total_ms > UPLOAD_RECV_TOTAL_TIMEOUT_MS) {
+                    ESP_LOGW(TAG, "[上传] raw接收超时 已收=%u/%u 空闲=%lldms 总耗时=%lldms",
+                             (unsigned)received, (unsigned)req->content_len,
+                             (long long)idle_ms, (long long)total_ms);
+                    *out_status_code = 408;
+                    *out_error = "RECV_TIMEOUT";
+                    goto cleanup;
+                }
+                vTaskDelay(pdMS_TO_TICKS(10));
+                continue;
+            }
+            ESP_LOGW(TAG, "[上传] raw接收失败 已收=%u/%u ret=%d",
+                     (unsigned)received, (unsigned)req->content_len, ret);
+            *out_status_code = 408;
+            *out_error = "RECV_FAILED";
+            goto cleanup;
+        }
+
+        ++recv_calls;
+        if ((size_t)ret < recv_min) recv_min = (size_t)ret;
+        if ((size_t)ret > recv_max) recv_max = (size_t)ret;
+        received += (size_t)ret;
+        last_data = now;
+
+        if (!kind) {
+            kind = detect_upload_kind_from_magic(rx, (size_t)ret);
+            if (!kind) {
+                ESP_LOGW(TAG, "[上传] raw类型不支持 文件名=%s 类型=%s 文件头=%02x %02x %02x %02x",
+                         filename && filename[0] ? filename : "(none)",
+                         content_type && content_type[0] ? content_type : "(none)",
+                         ret > 0 ? rx[0] : 0,
+                         ret > 1 ? rx[1] : 0,
+                         ret > 2 ? rx[2] : 0,
+                         ret > 3 ? rx[3] : 0);
+                *out_status_code = 415;
+                *out_error = "UNSUPPORTED_TYPE";
+                goto cleanup;
+            }
+            build_upload_paths(kind, final_path, final_path_len, lv_src, lv_src_len, tmp_path, sizeof(tmp_path));
+            unlink(tmp_path);
+            fd = open(tmp_path, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+            if (fd < 0) {
+                *out_status_code = 500;
+                *out_error = "SAVE_FAILED";
+                goto cleanup;
+            }
+            st.fd = fd;
+            write_started = esp_timer_get_time();
+            ESP_LOGI(TAG, "[上传] raw根据文件头识别格式=%s 文件名=%s 类型=%s 保存到=%s",
+                     kind,
+                     filename && filename[0] ? filename : "(none)",
+                     content_type && content_type[0] ? content_type : "(none)",
+                     final_path);
+        }
+
+        if (upload_stream_queue_file_bytes(&st, rx, (size_t)ret) != ESP_OK) {
+            *out_status_code = 500;
+            *out_error = "SAVE_FAILED";
+            goto cleanup;
+        }
+
+        if ((received % (128 * 1024)) < (size_t)ret || received == req->content_len) {
+            ESP_LOGI(TAG, "[上传] raw接收进度 %u/%u 文件=%u 耗时=%lldms",
+                     (unsigned)received, (unsigned)req->content_len, (unsigned)st.file_len,
+                     (long long)((now - started) / 1000));
+        }
+    }
+
+    if (!kind || fd < 0) {
+        *out_status_code = 415;
+        *out_error = "UNSUPPORTED_TYPE";
+        goto cleanup;
+    }
+    if (upload_stream_flush(&st) != ESP_OK) {
+        *out_status_code = 500;
+        *out_error = "SAVE_FAILED";
+        goto cleanup;
+    }
+    before_close = esp_timer_get_time();
+    close(fd);
+    fd = -1;
+    int64_t after_close = esp_timer_get_time();
+    int64_t rename_ms = 0;
+    if (finalize_upload_tmp_file(tmp_path, final_path, write_started, NULL, &rename_ms) != ESP_OK) {
+        *out_status_code = 500;
+        *out_error = "SAVE_FAILED";
+        goto cleanup;
+    }
+
+    *out_file_len = st.file_len;
+    ESP_LOGI(TAG, "[上传] 接收统计 调用=%u 单包=%u-%u 等待=%lldms 最长=%lldms 超时=%u",
+             (unsigned)recv_calls,
+             (unsigned)(recv_calls ? recv_min : 0),
+             (unsigned)recv_max,
+             (long long)(recv_wait_us / 1000),
+             (long long)(recv_wait_max_us / 1000),
+             (unsigned)recv_timeouts);
+    ESP_LOGI(TAG, "[上传] raw保存完成 格式=%s 字节=%u 接收窗口=%lldms SD实际写入=%lldms 写入次数=%u SD块=%u 关闭=%lldms 替换=%lldms 总耗时=%lldms SRAM=%lu PSRAM=%lu",
+             kind,
+             (unsigned)st.file_len,
+             (long long)((before_close - write_started) / 1000),
+             (long long)(st.write_elapsed_us / 1000),
+             (unsigned)st.write_calls,
+             (unsigned)st.write_buf_cap,
+             (long long)((after_close - before_close) / 1000),
+             (long long)rename_ms,
+             (long long)((esp_timer_get_time() - started) / 1000),
+             (unsigned long)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned long)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+    result = ESP_OK;
+
+cleanup:
+    if (fd >= 0) {
+        close(fd);
+    }
+    if (result != ESP_OK && tmp_path[0]) {
+        unlink(tmp_path);
+    }
+    heap_caps_free(rx);
+    heap_caps_free(write_buf);
+    return result;
 }
 
 static esp_err_t stream_multipart_upload_to_sd(httpd_req_t *req,
@@ -2278,12 +2584,28 @@ static esp_err_t stream_multipart_upload_to_sd(httpd_req_t *req,
     }
 
     const size_t rx_size = 8192;
+    size_t write_buf_cap = 16 * 1024;
     uint8_t *rx = (uint8_t *)heap_caps_malloc(rx_size, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    uint8_t *work = (uint8_t *)heap_caps_malloc(rx_size + 160, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    uint8_t *header_buf = (uint8_t *)heap_caps_malloc(8192, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    if (!rx || !work || !header_buf) {
+    uint8_t *work = (uint8_t *)heap_caps_malloc(rx_size + 160, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!work) {
+        work = (uint8_t *)heap_caps_malloc(rx_size + 160, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    }
+    uint8_t *write_buf = (uint8_t *)heap_caps_malloc(write_buf_cap,
+                                                      MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT | MALLOC_CAP_DMA);
+    if (!write_buf) {
+        write_buf_cap = 4 * 1024;
+        write_buf = (uint8_t *)heap_caps_malloc(write_buf_cap,
+                                                 MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT | MALLOC_CAP_DMA);
+    }
+    const size_t header_buf_cap = 8192;
+    uint8_t *header_buf = (uint8_t *)heap_caps_malloc(header_buf_cap, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!header_buf) {
+        header_buf = (uint8_t *)heap_caps_malloc(header_buf_cap, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    }
+    if (!rx || !work || !write_buf || !header_buf) {
         if (rx) heap_caps_free(rx);
         if (work) heap_caps_free(work);
+        if (write_buf) heap_caps_free(write_buf);
         if (header_buf) heap_caps_free(header_buf);
         *out_status_code = 500;
         *out_error = "NO_MEMORY";
@@ -2295,6 +2617,13 @@ static esp_err_t stream_multipart_upload_to_sd(httpd_req_t *req,
 
     size_t received = 0;
     size_t header_used = 0;
+    size_t recv_min = SIZE_MAX;
+    size_t recv_max = 0;
+    uint32_t recv_calls = 0;
+    uint32_t recv_timeouts = 0;
+    int64_t recv_wait_us = 0;
+    int64_t recv_wait_max_us = 0;
+    int skipped_parts = 0;
     int64_t last_data = started;
     bool header_done = false;
     char tmp_path[96] = {0};
@@ -2305,18 +2634,30 @@ static esp_err_t stream_multipart_upload_to_sd(httpd_req_t *req,
         .marker_len = marker_len,
         .work = work,
         .work_cap = rx_size + 160,
+        .write_buf = write_buf,
+        .write_buf_cap = write_buf_cap,
     };
     int64_t write_started = 0;
     int64_t before_close = 0;
     esp_err_t result = ESP_FAIL;
 
+    ESP_LOGI(TAG, "[上传] 传输上下文 BLE连接=%d BLE通知=%d AI忙碌=%d",
+             s_ble_conn_handle != BLE_HS_CONN_HANDLE_NONE ? 1 : 0,
+             s_ble_notify_enabled ? 1 : 0,
+             esp_ai_get_busy() ? 1 : 0);
+
     while (received < req->content_len && !st.found_end) {
         size_t to_read = req->content_len - received;
         if (to_read > rx_size) to_read = rx_size;
+        int64_t recv_started = esp_timer_get_time();
         int ret = httpd_req_recv(req, (char *)rx, to_read);
         int64_t now = esp_timer_get_time();
+        int64_t recv_elapsed_us = now - recv_started;
+        recv_wait_us += recv_elapsed_us;
+        if (recv_elapsed_us > recv_wait_max_us) recv_wait_max_us = recv_elapsed_us;
         if (ret <= 0) {
             if (ret == HTTPD_SOCK_ERR_TIMEOUT) {
+                ++recv_timeouts;
                 int64_t idle_ms = (now - last_data) / 1000;
                 int64_t total_ms = (now - started) / 1000;
                 if (idle_ms > UPLOAD_RECV_IDLE_TIMEOUT_MS || total_ms > UPLOAD_RECV_TOTAL_TIMEOUT_MS) {
@@ -2337,6 +2678,9 @@ static esp_err_t stream_multipart_upload_to_sd(httpd_req_t *req,
             goto cleanup;
         }
 
+        ++recv_calls;
+        if ((size_t)ret < recv_min) recv_min = (size_t)ret;
+        if ((size_t)ret > recv_max) recv_max = (size_t)ret;
         received += (size_t)ret;
         last_data = now;
         if ((received % (128 * 1024)) < (size_t)ret || received == req->content_len) {
@@ -2346,84 +2690,100 @@ static esp_err_t stream_multipart_upload_to_sd(httpd_req_t *req,
         }
 
         if (!header_done) {
-            if (header_used + (size_t)ret > 8192) {
+            if (header_used + (size_t)ret > header_buf_cap) {
                 *out_status_code = 400;
                 *out_error = "HEADER_TOO_LARGE";
                 goto cleanup;
             }
             memcpy(header_buf + header_used, rx, (size_t)ret);
             header_used += (size_t)ret;
-            const uint8_t *header_end = find_bytes(header_buf, header_used, "\r\n\r\n", 4);
-            if (!header_end) {
-                continue;
-            }
+            while (!header_done) {
+                const uint8_t *header_end = find_bytes(header_buf, header_used, "\r\n\r\n", 4);
+                if (!header_end) break;
 
-            size_t header_len = (size_t)(header_end - header_buf);
-            char *header = heap_caps_malloc(header_len + 1, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-            if (!header) {
-                *out_status_code = 500;
-                *out_error = "NO_MEMORY";
-                goto cleanup;
-            }
-            memcpy(header, header_buf, header_len);
-            header[header_len] = '\0';
+                size_t header_len = (size_t)(header_end - header_buf);
+                char *header = heap_caps_malloc(header_len + 1, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+                if (!header) {
+                    *out_status_code = 500;
+                    *out_error = "NO_MEMORY";
+                    goto cleanup;
+                }
+                memcpy(header, header_buf, header_len);
+                header[header_len] = '\0';
 
-            char filename[96] = {0};
-            char part_type[96] = {0};
-            extract_quoted_value(header, "filename=\"", filename, sizeof(filename));
-            char *ct = strstr(header, "Content-Type:");
-            if (ct) {
-                ct += strlen("Content-Type:");
-                while (*ct == ' ') ct++;
-                char *line_end = strstr(ct, "\r\n");
-                size_t len = line_end ? (size_t)(line_end - ct) : strlen(ct);
-                if (len >= sizeof(part_type)) len = sizeof(part_type) - 1;
-                memcpy(part_type, ct, len);
-                part_type[len] = '\0';
-            }
-            heap_caps_free(header);
+                char filename[96] = {0};
+                char part_type[96] = {0};
+                extract_quoted_value(header, "filename=\"", filename, sizeof(filename));
+                char *ct = strstr(header, "Content-Type:");
+                if (ct) {
+                    ct += strlen("Content-Type:");
+                    while (*ct == ' ') ct++;
+                    char *line_end = strstr(ct, "\r\n");
+                    size_t len = line_end ? (size_t)(line_end - ct) : strlen(ct);
+                    if (len >= sizeof(part_type)) len = sizeof(part_type) - 1;
+                    memcpy(part_type, ct, len);
+                    part_type[len] = '\0';
+                }
+                heap_caps_free(header);
 
-            size_t data_offset = (size_t)((header_end + 4) - header_buf);
-            size_t data_len = header_used - data_offset;
-            const char *kind = detect_upload_kind(filename, part_type);
-            if (!kind) {
-                kind = detect_upload_kind_from_magic(header_buf + data_offset, data_len);
-            }
-            if (!kind) {
-                ESP_LOGW(TAG, "[上传] 流式类型不支持 header=%u 文件名=%s 类型=%s 文件头=%02x %02x %02x %02x",
+                size_t data_offset = (size_t)((header_end + 4) - header_buf);
+                size_t data_len = header_used - data_offset;
+                const char *kind = detect_upload_kind(filename, part_type);
+                if (!kind) {
+                    kind = detect_upload_kind_from_magic(header_buf + data_offset, data_len);
+                }
+                if (!kind) {
+                    const uint8_t *next_marker = find_bytes(header_buf + data_offset, data_len, marker, marker_len);
+                    if (!next_marker) break;
+
+                    const uint8_t *after_marker = next_marker + marker_len;
+                    size_t remaining = (size_t)((header_buf + header_used) - after_marker);
+                    if (remaining < 2) break;
+                    if (after_marker[0] == '-' && after_marker[1] == '-') {
+                        *out_status_code = 400;
+                        *out_error = "NO_FILE_PART";
+                        goto cleanup;
+                    }
+                    if (after_marker[0] != '\r' || after_marker[1] != '\n') {
+                        *out_status_code = 400;
+                        *out_error = "BAD_MULTIPART";
+                        goto cleanup;
+                    }
+
+                    ++skipped_parts;
+                    ESP_LOGI(TAG, "[上传] 流式跳过普通字段 index=%d 文件名=%s 类型=%s",
+                             skipped_parts,
+                             filename[0] ? filename : "(none)",
+                             part_type[0] ? part_type : "(none)");
+                    remaining -= 2;
+                    memmove(header_buf, after_marker + 2, remaining);
+                    header_used = remaining;
+                    continue;
+                }
+
+                build_upload_paths(kind, final_path, final_path_len, lv_src, lv_src_len, tmp_path, sizeof(tmp_path));
+                unlink(tmp_path);
+                fd = open(tmp_path, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+                if (fd < 0) {
+                    *out_status_code = 500;
+                    *out_error = "SAVE_FAILED";
+                    goto cleanup;
+                }
+                st.fd = fd;
+                write_started = esp_timer_get_time();
+                header_done = true;
+
+                ESP_LOGI(TAG, "[上传] 流式头解析完成 header=%u 文件名=%s 类型=%s 格式=%s 保存到=%s",
                          (unsigned)header_len,
                          filename[0] ? filename : "(none)",
                          part_type[0] ? part_type : "(none)",
-                         data_len > 0 ? header_buf[data_offset + 0] : 0,
-                         data_len > 1 ? header_buf[data_offset + 1] : 0,
-                         data_len > 2 ? header_buf[data_offset + 2] : 0,
-                         data_len > 3 ? header_buf[data_offset + 3] : 0);
-                *out_status_code = 415;
-                *out_error = "UNSUPPORTED_TYPE";
-                goto cleanup;
-            }
-            build_upload_paths(kind, final_path, final_path_len, lv_src, lv_src_len, tmp_path, sizeof(tmp_path));
-            unlink(tmp_path);
-            fd = open(tmp_path, O_WRONLY | O_CREAT | O_TRUNC, 0666);
-            if (fd < 0) {
-                *out_status_code = 500;
-                *out_error = "SAVE_FAILED";
-                goto cleanup;
-            }
-            st.fd = fd;
-            write_started = esp_timer_get_time();
-            header_done = true;
-
-            ESP_LOGI(TAG, "[上传] 流式头解析完成 header=%u 文件名=%s 类型=%s 格式=%s 保存到=%s",
-                     (unsigned)header_len,
-                     filename[0] ? filename : "(none)",
-                     part_type[0] ? part_type : "(none)",
-                     kind,
-                     final_path);
-            if (data_len > 0 && upload_stream_write_file_bytes(&st, header_buf + data_offset, data_len) != ESP_OK) {
-                *out_status_code = 500;
-                *out_error = "SAVE_FAILED";
-                goto cleanup;
+                         kind,
+                         final_path);
+                if (data_len > 0 && upload_stream_write_file_bytes(&st, header_buf + data_offset, data_len) != ESP_OK) {
+                    *out_status_code = 500;
+                    *out_error = "SAVE_FAILED";
+                    goto cleanup;
+                }
             }
         } else {
             if (upload_stream_write_file_bytes(&st, rx, (size_t)ret) != ESP_OK) {
@@ -2444,6 +2804,11 @@ static esp_err_t stream_multipart_upload_to_sd(httpd_req_t *req,
         drain_upload_remainder(req, rx, rx_size, &received);
     }
 
+    if (upload_stream_flush(&st) != ESP_OK) {
+        *out_status_code = 500;
+        *out_error = "SAVE_FAILED";
+        goto cleanup;
+    }
     before_close = esp_timer_get_time();
     close(fd);
     fd = -1;
@@ -2456,9 +2821,19 @@ static esp_err_t stream_multipart_upload_to_sd(httpd_req_t *req,
     }
 
     *out_file_len = st.file_len;
-    ESP_LOGI(TAG, "[上传] 流式保存完成 字节=%u 写入=%lldms 关闭=%lldms 替换=%lldms 总耗时=%lldms SRAM=%lu PSRAM=%lu",
+    ESP_LOGI(TAG, "[上传] 接收统计 调用=%u 单包=%u-%u 等待=%lldms 最长=%lldms 超时=%u",
+             (unsigned)recv_calls,
+             (unsigned)(recv_calls ? recv_min : 0),
+             (unsigned)recv_max,
+             (long long)(recv_wait_us / 1000),
+             (long long)(recv_wait_max_us / 1000),
+             (unsigned)recv_timeouts);
+    ESP_LOGI(TAG, "[上传] 流式保存完成 字节=%u 接收窗口=%lldms SD实际写入=%lldms 写入次数=%u SD块=%u 关闭=%lldms 替换=%lldms 总耗时=%lldms SRAM=%lu PSRAM=%lu",
              (unsigned)st.file_len,
              (long long)((before_close - write_started) / 1000),
+             (long long)(st.write_elapsed_us / 1000),
+             (unsigned)st.write_calls,
+             (unsigned)st.write_buf_cap,
              (long long)((after_close - before_close) / 1000),
              (long long)rename_ms,
              (long long)((esp_timer_get_time() - started) / 1000),
@@ -2475,6 +2850,7 @@ cleanup:
     }
     heap_caps_free(rx);
     heap_caps_free(work);
+    heap_caps_free(write_buf);
     heap_caps_free(header_buf);
     return result;
 }
@@ -2937,8 +3313,10 @@ static esp_err_t upload_post_handler(httpd_req_t *req)
     char lv_src[96] = {0};
     const char *kind = NULL;
     bool should_show = false;
+    bool keep_upload_active_until_display = false;
     int status_code = 200;
     const char *error = NULL;
+    upload_wifi_ps_guard_t wifi_ps_guard = {0};
 
     ESP_LOGI(TAG, "[上传] 开始 总长度=%u 可用SRAM=%lu 可用PSRAM=%lu",
              (unsigned)body_len,
@@ -2951,12 +3329,15 @@ static esp_err_t upload_post_handler(httpd_req_t *req)
         goto done;
     }
 
+    upload_wifi_performance_begin(&wifi_ps_guard);
+
     char content_type[160] = {0};
     httpd_req_get_hdr_value_str(req, "Content-Type", content_type, sizeof(content_type));
 
+    const bool is_multipart = strstr(content_type, "multipart/form-data") != NULL;
     const size_t stream_upload_threshold = 2 * 1024 * 1024;
-    if (strstr(content_type, "multipart/form-data") && body_len > stream_upload_threshold) {
-        ESP_LOGI(TAG, "[上传] 使用流式路径 阈值=%u", (unsigned)stream_upload_threshold);
+    if (is_multipart && body_len > stream_upload_threshold) {
+        ESP_LOGI(TAG, "[上传] 使用流式路径：文件较大，边接收边写入SD 阈值=%u", (unsigned)stream_upload_threshold);
         esp_err_t stream_err = stream_multipart_upload_to_sd(req,
                                                              content_type,
                                                              started,
@@ -2973,16 +3354,48 @@ static esp_err_t upload_post_handler(httpd_req_t *req)
         should_show = true;
         if (should_show) {
             cleanup_static_uploads_except(final_path);
-            request_show_uploaded_image(final_path, lv_src);
+            keep_upload_active_until_display = request_show_uploaded_image(final_path, lv_src);
+            if (keep_upload_active_until_display) {
+                ESP_LOGI(TAG, "[上传] 文件已保存，等待图片显示完成后恢复业务WS");
+            }
         }
         ESP_LOGI(TAG, "[上传] 流式文件已保存 文件=%s 字节=%u 耗时=%lldms",
                  final_path, (unsigned)file_len, (long long)((esp_timer_get_time() - started) / 1000));
         goto done;
     }
-    if (strstr(content_type, "multipart/form-data")) {
-        ESP_LOGI(TAG, "[上传] 使用缓冲路径 阈值=%u", (unsigned)stream_upload_threshold);
+    if (!is_multipart) {
+        char raw_filename[96] = {0};
+        get_upload_filename_from_request(req, raw_filename, sizeof(raw_filename));
+        ESP_LOGI(TAG, "[上传] 使用raw直传路径：小程序预处理图片直接写入SD 文件名=%s 类型=%s",
+                 raw_filename[0] ? raw_filename : "(none)",
+                 content_type[0] ? content_type : "(none)");
+        esp_err_t raw_err = stream_raw_upload_to_sd(req,
+                                                    content_type,
+                                                    raw_filename,
+                                                    started,
+                                                    final_path,
+                                                    sizeof(final_path),
+                                                    lv_src,
+                                                    sizeof(lv_src),
+                                                    &file_len,
+                                                    &error,
+                                                    &status_code);
+        if (raw_err != ESP_OK) {
+            goto done;
+        }
+        should_show = true;
+        cleanup_static_uploads_except(final_path);
+        keep_upload_active_until_display = request_show_uploaded_image(final_path, lv_src);
+        if (keep_upload_active_until_display) {
+            ESP_LOGI(TAG, "[上传] 文件已保存，等待图片显示完成后恢复业务WS");
+        }
+        ESP_LOGI(TAG, "[上传] raw文件已保存 文件=%s 字节=%u 耗时=%lldms",
+                 final_path, (unsigned)file_len, (long long)((esp_timer_get_time() - started) / 1000));
+        goto done;
     }
-
+    if (is_multipart) {
+        ESP_LOGI(TAG, "[上传] 使用缓冲路径：小文件先接收完整再写入SD 阈值=%u", (unsigned)stream_upload_threshold);
+    }
     body = heap_caps_malloc(body_len + 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!body) {
         body = heap_caps_malloc(body_len + 1, MALLOC_CAP_8BIT);
@@ -2993,11 +3406,29 @@ static esp_err_t upload_post_handler(httpd_req_t *req)
         goto done;
     }
 
+    const size_t buffered_recv_chunk = 8192;
     size_t offset = 0;
+    size_t recv_min = SIZE_MAX;
+    size_t recv_max = 0;
+    uint32_t recv_calls = 0;
+    uint32_t recv_timeouts = 0;
+    int64_t recv_wait_us = 0;
+    int64_t recv_wait_max_us = 0;
     while (offset < body_len) {
-        int ret = httpd_req_recv(req, (char *)body + offset, body_len - offset);
+        size_t to_read = body_len - offset;
+        if (to_read > buffered_recv_chunk) {
+            to_read = buffered_recv_chunk;
+        }
+        int64_t recv_started = esp_timer_get_time();
+        int ret = httpd_req_recv(req, (char *)body + offset, to_read);
         int64_t now = esp_timer_get_time();
+        int64_t recv_elapsed_us = now - recv_started;
+        recv_wait_us += recv_elapsed_us;
+        if (recv_elapsed_us > recv_wait_max_us) recv_wait_max_us = recv_elapsed_us;
         if (ret > 0) {
+            ++recv_calls;
+            if ((size_t)ret < recv_min) recv_min = (size_t)ret;
+            if ((size_t)ret > recv_max) recv_max = (size_t)ret;
             offset += (size_t)ret;
             last_data = now;
             if ((offset % (128 * 1024)) < (size_t)ret || offset == body_len) {
@@ -3008,6 +3439,7 @@ static esp_err_t upload_post_handler(httpd_req_t *req)
         }
 
         if (ret == HTTPD_SOCK_ERR_TIMEOUT) {
+            ++recv_timeouts;
             int64_t idle_ms = (now - last_data) / 1000;
             int64_t total_ms = (now - started) / 1000;
             if (idle_ms > UPLOAD_RECV_IDLE_TIMEOUT_MS || total_ms > UPLOAD_RECV_TOTAL_TIMEOUT_MS) {
@@ -3027,6 +3459,13 @@ static esp_err_t upload_post_handler(httpd_req_t *req)
         goto done;
     }
     body[body_len] = 0;
+    ESP_LOGI(TAG, "[上传] 接收统计 调用=%u 单包=%u-%u 等待=%lldms 最长=%lldms 超时=%u",
+             (unsigned)recv_calls,
+             (unsigned)(recv_calls ? recv_min : 0),
+             (unsigned)recv_max,
+             (long long)(recv_wait_us / 1000),
+             (long long)(recv_wait_max_us / 1000),
+             (unsigned)recv_timeouts);
 
     file_data = body;
     file_len = body_len;
@@ -3111,7 +3550,10 @@ static esp_err_t upload_post_handler(httpd_req_t *req)
 
     if (should_show) {
         cleanup_static_uploads_except(final_path);
-        request_show_uploaded_image(final_path, lv_src);
+        keep_upload_active_until_display = request_show_uploaded_image(final_path, lv_src);
+        if (keep_upload_active_until_display) {
+            ESP_LOGI(TAG, "[上传] 文件已保存，等待图片显示完成后恢复业务WS");
+        }
     }
 
     ESP_LOGI(TAG, "[上传] 保存完成 格式=%s 文件=%s 字节=%u 耗时=%lldms",
@@ -3121,7 +3563,10 @@ done:
     if (body) {
         heap_caps_free(body);
     }
-    esp_ai_set_upload_active(false);
+    upload_wifi_performance_end(&wifi_ps_guard);
+    if (!keep_upload_active_until_display) {
+        esp_ai_set_upload_active(false);
+    }
 
     if (error) {
         ESP_LOGW(TAG, "[上传] 失败 错误=%s HTTP状态=%d 耗时=%lldms",
