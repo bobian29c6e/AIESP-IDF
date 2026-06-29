@@ -3,6 +3,7 @@
 #include "esp_event.h"
 #include "esp_netif.h"
 #include "esp_wifi.h"
+#include "esp_mac.h"
 #include "esp-ai.h"
 #include "esp-ai-ui.h"
 #include "esp-ai-sd.h"
@@ -15,6 +16,9 @@
 #include <unistd.h>
 #include "esp_http_server.h"
 #include "esp_http_client.h"
+#include "esp_ota_ops.h"
+#include "esp_app_desc.h"
+#include "mbedtls/sha256.h"
 #include "esp_timer.h"
 #include "lvgl.h"
 #include "extra/libs/gif/lv_gif.h"
@@ -22,6 +26,7 @@
 #include "esp_sntp.h"
 #include "cJSON.h"
 #include <string.h>
+#include <strings.h>
 #include <stdlib.h>
 #include "esp_heap_caps.h"
 #include "esp_system.h"
@@ -85,6 +90,9 @@ esp_err_t esp_ai_nvs_load(const char* key, char* out_value, size_t max_len);
 
 static void refresh_business_ws_config(const char *reason);
 static void send_business_ws_volume_update(float volume);
+static void init_device_id(void);
+static void schedule_device_binding(const char *reason);
+static void set_binding_status(const char *status, bool bound, bool persist);
 static bool apply_screensaver_json(cJSON *root);
 static bool normalize_display_mode(const char *in, char *out, size_t out_len);
 static bool copy_json_string(cJSON *root, const char *key, char *out, size_t out_len);
@@ -100,7 +108,11 @@ static bool find_preferred_startup_image(char *fs_path, size_t fs_len, char *lv_
 static void show_startup_image_or_status(void);
 static esp_err_t show_uploaded_image_now(const char *fs_path, const char *lv_src);
 static bool request_show_uploaded_image(const char *fs_path, const char *lv_src);
+static bool is_ota_active(void);
+static void mark_current_app_valid_if_pending(void);
 
+static const char s_firmware_version[] = "1.1.0";
+static const char s_bin_id[] = "6af4b3e053e3420db312451f9fb38eab";
 static const char s_default_api_key[] = "";
 static const char s_default_volume[] = "0.7";
 static const char s_default_persona_id[] = "1";
@@ -116,19 +128,23 @@ static const char s_default_personality[] =
 static EXT_RAM_BSS_ATTR char s_api_key[80];
 static EXT_RAM_BSS_ATTR char s_ext1[80];
 static EXT_RAM_BSS_ATTR char s_user_api_key[80];
+static EXT_RAM_BSS_ATTR char s_device_id[18];
+static EXT_RAM_BSS_ATTR char s_binding_status[24];
 static EXT_RAM_BSS_ATTR char s_volume_str[16];
 static EXT_RAM_BSS_ATTR char s_persona_id[32];
 static EXT_RAM_BSS_ATTR char s_voice_id[128];
 static EXT_RAM_BSS_ATTR char s_wifi_ssid[33];
 static EXT_RAM_BSS_ATTR char s_wifi_password[65];
 static EXT_RAM_BSS_ATTR char s_personality[2048];
+static volatile bool s_binding_task_active = false;
+static bool s_device_bound = false;
 
 static esp_ai_config_t s_ai_cfg = {
     .server = {
         .server_uri = "ws://node.espai2.fun:80/connect_espai_node",
         .api_key = s_api_key,
         .ext1 = s_ext1,
-        .device_id = "98:A3:16:E3:F9:10",
+        .device_id = s_device_id,
         .volume = s_volume_str,
         .persona = s_persona_id,
         .voice = s_voice_id
@@ -145,6 +161,7 @@ static esp_ai_config_t s_ai_cfg = {
 
 static void load_runtime_config(void)
 {
+    init_device_id();
     strlcpy(s_api_key, s_default_api_key, sizeof(s_api_key));
     strlcpy(s_ext1, s_default_api_key, sizeof(s_ext1));
     s_user_api_key[0] = '\0';
@@ -172,6 +189,19 @@ static void load_runtime_config(void)
     esp_ai_nvs_load("wifi_name", s_wifi_ssid, sizeof(s_wifi_ssid));
     esp_ai_nvs_load("wifi_pwd", s_wifi_password, sizeof(s_wifi_password));
 
+    strlcpy(s_binding_status, "unknown", sizeof(s_binding_status));
+    char bound_tmp[8];
+    if (esp_ai_nvs_load("device_bound", bound_tmp, sizeof(bound_tmp)) == ESP_OK && strcmp(bound_tmp, "1") == 0) {
+        s_device_bound = true;
+        strlcpy(s_binding_status, "bound", sizeof(s_binding_status));
+    } else {
+        s_device_bound = false;
+        if (esp_ai_nvs_load("binding_status", s_binding_status, sizeof(s_binding_status)) != ESP_OK ||
+            s_binding_status[0] == '\0') {
+            strlcpy(s_binding_status, s_api_key[0] ? "pending" : "no_key", sizeof(s_binding_status));
+        }
+    }
+
     char tmp[24];
     if (esp_ai_nvs_load("screensaver_theme", tmp, sizeof(tmp)) == ESP_OK) {
         s_screensaver_theme = atoi(tmp);
@@ -197,13 +227,16 @@ static void load_runtime_config(void)
 
     s_ai_cfg.server.api_key = s_api_key;
     s_ai_cfg.server.ext1 = s_ext1;
+    s_ai_cfg.server.device_id = s_device_id;
     s_ai_cfg.server.volume = s_volume_str;
     s_ai_cfg.server.voice = s_voice_id;
     s_ai_cfg.server.persona = s_persona_id;
+    esp_ai_nvs_save("device_id", s_device_id);
     esp_ai_set_volume(strtof(s_volume_str, NULL));
-    ESP_LOGI(TAG, "运行配置已加载: api_key=%c%c%c%c**** 音色=%s 音量=%s 人设ID=%s 人设长度=%u",
-             s_api_key[0], s_api_key[1], s_api_key[2], s_api_key[3], s_voice_id, s_volume_str,
-             s_persona_id, (unsigned)strlen(s_personality));
+    ESP_LOGI(TAG, "运行配置已加载: device_id=%s api_key=%c%c%c%c**** 绑定=%s 音色=%s 音量=%s 人设ID=%s 人设长度=%u",
+             s_device_id,
+             s_api_key[0], s_api_key[1], s_api_key[2], s_api_key[3], s_binding_status,
+             s_voice_id, s_volume_str, s_persona_id, (unsigned)strlen(s_personality));
     ESP_LOGI(TAG, "WiFi配置已加载: ssid=%s 密码长度=%u", s_wifi_ssid, (unsigned)strlen(s_wifi_password));
 }
 
@@ -218,6 +251,32 @@ static void delayed_restart_task(void *arg)
 static void schedule_restart(int delay_ms)
 {
     xTaskCreate(delayed_restart_task, "cfg_restart", 2048, (void *)(intptr_t)delay_ms, 3, NULL);
+}
+
+static void init_device_id(void)
+{
+    uint8_t mac[6] = {0};
+    esp_err_t err = esp_read_mac(mac, ESP_MAC_WIFI_STA);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "[绑定] 读取WiFi MAC失败，使用base MAC err=%s", esp_err_to_name(err));
+        err = esp_read_mac(mac, ESP_MAC_BASE);
+    }
+    if (err == ESP_OK) {
+        snprintf(s_device_id, sizeof(s_device_id), "%02X:%02X:%02X:%02X:%02X:%02X",
+                 mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    } else {
+        strlcpy(s_device_id, "00:00:00:00:00:00", sizeof(s_device_id));
+    }
+}
+
+static void set_binding_status(const char *status, bool bound, bool persist)
+{
+    strlcpy(s_binding_status, status && status[0] ? status : "unknown", sizeof(s_binding_status));
+    s_device_bound = bound;
+    if (persist) {
+        esp_ai_nvs_save("binding_status", s_binding_status);
+        esp_ai_nvs_save("device_bound", bound ? "1" : "0");
+    }
 }
 
 static bool is_wall_time_valid(time_t now)
@@ -850,7 +909,7 @@ static void refresh_business_ws_config(const char *reason)
 {
     otakulink_business_ws_config_t bws_cfg = {
         .device_id = s_ai_cfg.server.device_id,
-        .version = "1.1.0",
+        .version = s_firmware_version,
         .api_key = s_ext1,
         .ext2 = s_volume_str,
         .ext3 = s_persona_id,
@@ -1183,12 +1242,17 @@ static void start_ai_if_needed(void)
     if (s_ai_started) {
         return;
     }
+    if (s_api_key[0] == '\0') {
+        ESP_LOGI(TAG, "API Key为空，暂不启动ESP-AI，等待小程序通过 /api/apikey 配置");
+        return;
+    }
     esp_ai_on_ready(on_ai_ready);
     esp_ai_on_command(on_ai_command);
     esp_err_t err = esp_ai_begin(&s_ai_cfg);
     if (err == ESP_OK) {
         s_ai_started = true;
         refresh_business_ws_config("ai_started");
+        schedule_device_binding("ai_started");
         ESP_LOGI(TAG, "WiFi获取IP后已启动ESP-AI服务");
     } else {
         ESP_LOGE(TAG, "ESP-AI启动失败: %s", esp_err_to_name(err));
@@ -1413,6 +1477,7 @@ static void ble_wifi_connect_task(void *arg)
         ble_send_text("WIFI_OK:连接成功");
         start_webserver();
         request_ai_start();
+        schedule_device_binding("ble_wifi_connected");
     } else {
         ble_send_text("WIFI_ERROR:连接超时，请检查WiFi账号密码");
     }
@@ -1643,7 +1708,7 @@ static void set_cors_headers(httpd_req_t *req)
 {
     httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
     httpd_resp_set_hdr(req, "Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-    httpd_resp_set_hdr(req, "Access-Control-Allow-Headers", "Content-Type, X-Filename, X-File-Name");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Headers", "Content-Type, X-Filename, X-File-Name, X-OTA-Session");
 }
 
 static esp_err_t options_handler(httpd_req_t *req)
@@ -1711,6 +1776,604 @@ static char *read_request_body_alloc(httpd_req_t *req, size_t max_len)
     }
     buf[offset] = '\0';
     return buf;
+}
+
+#define OTA_RECOMMENDED_CHUNK_SIZE (64 * 1024)
+#define OTA_MAX_CHUNK_SIZE (256 * 1024)
+#define OTA_SESSION_LEN 24
+
+typedef struct {
+    bool active;
+    bool update_started;
+    char session[OTA_SESSION_LEN];
+    char expected_sha256[65];
+    char version[48];
+    char last_error[80];
+    uint32_t size;
+    uint32_t received;
+    uint32_t chunks;
+    int64_t started_us;
+    int64_t last_write_us;
+    esp_ota_handle_t handle;
+    const esp_partition_t *partition;
+    mbedtls_sha256_context sha_ctx;
+} ota_state_t;
+
+static SemaphoreHandle_t s_ota_mutex;
+static ota_state_t s_ota;
+
+static bool is_hex64(const char *s)
+{
+    if (!s || strlen(s) != 64) return false;
+    for (size_t i = 0; i < 64; ++i) {
+        char c = s[i];
+        bool ok = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+        if (!ok) return false;
+    }
+    return true;
+}
+
+static void lowercase_hex(char *s)
+{
+    for (; s && *s; ++s) {
+        if (*s >= 'A' && *s <= 'F') {
+            *s = (char)(*s - 'A' + 'a');
+        }
+    }
+}
+
+static void bytes_to_hex(const uint8_t *in, size_t len, char *out, size_t out_len)
+{
+    static const char hex[] = "0123456789abcdef";
+    if (out_len == 0) return;
+    size_t pos = 0;
+    for (size_t i = 0; i < len && pos + 2 < out_len; ++i) {
+        out[pos++] = hex[(in[i] >> 4) & 0x0f];
+        out[pos++] = hex[in[i] & 0x0f];
+    }
+    out[pos] = '\0';
+}
+
+static void make_ota_session(char *out, size_t out_len)
+{
+    uint32_t a = esp_random();
+    uint32_t b = esp_random();
+    snprintf(out, out_len, "%08lx%08lx", (unsigned long)a, (unsigned long)b);
+}
+
+static bool is_ota_active(void)
+{
+    bool active = false;
+    if (s_ota_mutex && xSemaphoreTake(s_ota_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        active = s_ota.active;
+        xSemaphoreGive(s_ota_mutex);
+    }
+    return active;
+}
+
+static void ota_set_last_error_locked(const char *error)
+{
+    strlcpy(s_ota.last_error, error ? error : "", sizeof(s_ota.last_error));
+}
+
+static void ota_abort_locked(const char *reason)
+{
+    if (s_ota.update_started) {
+        esp_ota_abort(s_ota.handle);
+    }
+    if (s_ota.active) {
+        ESP_LOGW(TAG, "[OTA] 已中止 原因=%s 已收=%lu/%lu 分片=%lu",
+                 reason ? reason : "(none)",
+                 (unsigned long)s_ota.received,
+                 (unsigned long)s_ota.size,
+                 (unsigned long)s_ota.chunks);
+    }
+    mbedtls_sha256_free(&s_ota.sha_ctx);
+    memset(&s_ota, 0, sizeof(s_ota));
+    if (reason) {
+        strlcpy(s_ota.last_error, reason, sizeof(s_ota.last_error));
+    }
+}
+
+static void ota_clear_finished_locked(void)
+{
+    mbedtls_sha256_free(&s_ota.sha_ctx);
+    memset(&s_ota, 0, sizeof(s_ota));
+}
+
+static void ota_pause_background_work(const char *reason)
+{
+    otakulink_system_pause_business_ws_for_ai(reason ? reason : "ota_active");
+}
+
+static void send_ota_busy_response(httpd_req_t *req)
+{
+    set_cors_headers(req);
+    httpd_resp_set_status(req, "423 Locked");
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, "{\"success\":false,\"error\":\"OTA_UPDATING\"}", HTTPD_RESP_USE_STRLEN);
+}
+
+static bool ota_get_query_u32(httpd_req_t *req, const char *key, uint32_t *out)
+{
+    char value[32];
+    if (!get_query_value(req, key, value, sizeof(value))) {
+        return false;
+    }
+    char *end = NULL;
+    unsigned long parsed = strtoul(value, &end, 10);
+    if (!end || *end != '\0') {
+        return false;
+    }
+    *out = (uint32_t)parsed;
+    return true;
+}
+
+static bool ota_get_session_from_request(httpd_req_t *req, char *out, size_t out_len)
+{
+    if (get_query_value(req, "session", out, out_len)) {
+        return true;
+    }
+    if (httpd_req_get_hdr_value_str(req, "X-OTA-Session", out, out_len) == ESP_OK) {
+        return true;
+    }
+    return false;
+}
+
+static void mark_current_app_valid_if_pending(void)
+{
+    const esp_partition_t *running = esp_ota_get_running_partition();
+    esp_ota_img_states_t state = ESP_OTA_IMG_UNDEFINED;
+    if (running && esp_ota_get_state_partition(running, &state) == ESP_OK && state == ESP_OTA_IMG_PENDING_VERIFY) {
+        esp_err_t err = esp_ota_mark_app_valid_cancel_rollback();
+        ESP_LOGI(TAG, "[OTA] 当前固件启动确认 %s 分区=%s",
+                 err == ESP_OK ? "成功" : esp_err_to_name(err),
+                 running->label);
+    }
+}
+
+static esp_err_t ota_status_handler(httpd_req_t *req)
+{
+    set_cors_headers(req);
+    char resp[768];
+    bool active = false;
+    char session[OTA_SESSION_LEN] = {0};
+    char version[48] = {0};
+    char error[80] = {0};
+    uint32_t size = 0;
+    uint32_t received = 0;
+    uint32_t chunks = 0;
+    uint32_t partition_size = 0;
+    int64_t elapsed_ms = 0;
+    const char *running_label = "(none)";
+    const char *next_label = "(none)";
+
+    const esp_partition_t *running = esp_ota_get_running_partition();
+    const esp_partition_t *next = esp_ota_get_next_update_partition(NULL);
+    if (running) running_label = running->label;
+    if (next) next_label = next->label;
+
+    if (s_ota_mutex && xSemaphoreTake(s_ota_mutex, pdMS_TO_TICKS(200)) == pdTRUE) {
+        active = s_ota.active;
+        strlcpy(session, s_ota.session, sizeof(session));
+        strlcpy(version, s_ota.version, sizeof(version));
+        strlcpy(error, s_ota.last_error, sizeof(error));
+        size = s_ota.size;
+        received = s_ota.received;
+        chunks = s_ota.chunks;
+        partition_size = s_ota.partition ? s_ota.partition->size : (next ? next->size : 0);
+        if (s_ota.started_us > 0) {
+            elapsed_ms = (esp_timer_get_time() - s_ota.started_us) / 1000;
+        }
+        xSemaphoreGive(s_ota_mutex);
+    }
+
+    snprintf(resp, sizeof(resp),
+             "{\"success\":true,\"active\":%s,\"session\":\"%s\","
+             "\"version\":\"%s\",\"size\":%lu,\"received\":%lu,\"chunks\":%lu,"
+             "\"partition_size\":%lu,\"running_partition\":\"%s\","
+             "\"next_partition\":\"%s\",\"elapsed_ms\":%lld,\"last_error\":\"%s\"}",
+             active ? "true" : "false",
+             session,
+             version,
+             (unsigned long)size,
+             (unsigned long)received,
+             (unsigned long)chunks,
+             (unsigned long)partition_size,
+             running_label,
+             next_label,
+             (long long)elapsed_ms,
+             error);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, resp, HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+static esp_err_t ota_start_handler(httpd_req_t *req)
+{
+    set_cors_headers(req);
+    char *body = read_request_body_alloc(req, 1024);
+    cJSON *root = body ? cJSON_Parse(body) : NULL;
+    cJSON *size_item = root ? cJSON_GetObjectItem(root, "size") : NULL;
+    cJSON *sha_item = root ? cJSON_GetObjectItem(root, "sha256") : NULL;
+    cJSON *version_item = root ? cJSON_GetObjectItem(root, "version") : NULL;
+
+    uint32_t size = cJSON_IsNumber(size_item) ? (uint32_t)size_item->valuedouble : 0;
+    const char *sha = cJSON_IsString(sha_item) ? sha_item->valuestring : NULL;
+    const char *version = cJSON_IsString(version_item) ? version_item->valuestring : "";
+
+    char resp[384];
+    int status = 200;
+    const char *error = NULL;
+
+    if (size == 0 || !is_hex64(sha)) {
+        status = 400;
+        error = "BAD_REQUEST";
+        goto done;
+    }
+
+    if (!s_ota_mutex) {
+        status = 500;
+        error = "OTA_NOT_READY";
+        goto done;
+    }
+
+    if (xSemaphoreTake(s_ota_mutex, pdMS_TO_TICKS(1000)) != pdTRUE) {
+        status = 503;
+        error = "OTA_BUSY";
+        goto done;
+    }
+
+    if (s_ota.active) {
+        xSemaphoreGive(s_ota_mutex);
+        status = 409;
+        error = "OTA_ALREADY_ACTIVE";
+        goto done;
+    }
+
+    const esp_partition_t *partition = esp_ota_get_next_update_partition(NULL);
+    if (!partition) {
+        xSemaphoreGive(s_ota_mutex);
+        status = 500;
+        error = "NO_OTA_PARTITION";
+        goto done;
+    }
+    if (size > partition->size) {
+        xSemaphoreGive(s_ota_mutex);
+        status = 413;
+        error = "FIRMWARE_TOO_LARGE";
+        goto done;
+    }
+
+    memset(&s_ota, 0, sizeof(s_ota));
+    s_ota.active = true;
+    s_ota.partition = partition;
+    s_ota.size = size;
+    s_ota.started_us = esp_timer_get_time();
+    s_ota.last_write_us = s_ota.started_us;
+    strlcpy(s_ota.expected_sha256, sha, sizeof(s_ota.expected_sha256));
+    lowercase_hex(s_ota.expected_sha256);
+    strlcpy(s_ota.version, version, sizeof(s_ota.version));
+    make_ota_session(s_ota.session, sizeof(s_ota.session));
+    mbedtls_sha256_init(&s_ota.sha_ctx);
+    mbedtls_sha256_starts(&s_ota.sha_ctx, 0);
+
+    esp_err_t begin_err = esp_ota_begin(partition, size, &s_ota.handle);
+    if (begin_err != ESP_OK) {
+        ota_abort_locked(esp_err_to_name(begin_err));
+        xSemaphoreGive(s_ota_mutex);
+        status = 500;
+        error = "OTA_BEGIN_FAILED";
+        goto done;
+    }
+    s_ota.update_started = true;
+
+    ESP_LOGI(TAG, "[OTA] 开始 会话=%s 分区=%s 固件=%lu 分区容量=%lu 版本=%s",
+             s_ota.session,
+             partition->label,
+             (unsigned long)s_ota.size,
+             (unsigned long)partition->size,
+             s_ota.version[0] ? s_ota.version : "(none)");
+    ota_pause_background_work("ota_start");
+    snprintf(resp, sizeof(resp),
+             "{\"success\":true,\"session\":\"%s\",\"chunk_size\":%u,"
+             "\"partition\":\"%s\",\"partition_size\":%lu,\"received\":0}",
+             s_ota.session,
+             OTA_RECOMMENDED_CHUNK_SIZE,
+             partition->label,
+             (unsigned long)partition->size);
+    xSemaphoreGive(s_ota_mutex);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, resp, HTTPD_RESP_USE_STRLEN);
+
+done:
+    if (root) cJSON_Delete(root);
+    if (body) heap_caps_free(body);
+    if (error) {
+        if (status == 400) httpd_resp_set_status(req, "400 Bad Request");
+        else if (status == 409) httpd_resp_set_status(req, "409 Conflict");
+        else if (status == 413) httpd_resp_set_status(req, "413 Payload Too Large");
+        else if (status == 503) httpd_resp_set_status(req, "503 Service Unavailable");
+        else httpd_resp_set_status(req, "500 Internal Server Error");
+        snprintf(resp, sizeof(resp), "{\"success\":false,\"error\":\"%s\"}", error);
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_send(req, resp, HTTPD_RESP_USE_STRLEN);
+    }
+    return ESP_OK;
+}
+
+static esp_err_t ota_chunk_handler(httpd_req_t *req)
+{
+    set_cors_headers(req);
+    char session[OTA_SESSION_LEN] = {0};
+    uint32_t offset_arg = UINT32_MAX;
+    uint32_t index_arg = 0;
+    ota_get_session_from_request(req, session, sizeof(session));
+    ota_get_query_u32(req, "offset", &offset_arg);
+    ota_get_query_u32(req, "index", &index_arg);
+
+    if (req->content_len == 0 || req->content_len > OTA_MAX_CHUNK_SIZE || session[0] == '\0') {
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_send(req, "{\"success\":false,\"error\":\"BAD_CHUNK_REQUEST\"}", HTTPD_RESP_USE_STRLEN);
+        return ESP_OK;
+    }
+
+    if (xSemaphoreTake(s_ota_mutex, pdMS_TO_TICKS(30000)) != pdTRUE) {
+        httpd_resp_set_status(req, "503 Service Unavailable");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_send(req, "{\"success\":false,\"error\":\"OTA_LOCK_TIMEOUT\"}", HTTPD_RESP_USE_STRLEN);
+        return ESP_OK;
+    }
+
+    if (!s_ota.active || strcmp(session, s_ota.session) != 0) {
+        xSemaphoreGive(s_ota_mutex);
+        httpd_resp_set_status(req, "409 Conflict");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_send(req, "{\"success\":false,\"error\":\"BAD_SESSION\"}", HTTPD_RESP_USE_STRLEN);
+        return ESP_OK;
+    }
+    if (offset_arg != UINT32_MAX && offset_arg != s_ota.received) {
+        xSemaphoreGive(s_ota_mutex);
+        httpd_resp_set_status(req, "409 Conflict");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_send(req, "{\"success\":false,\"error\":\"BAD_OFFSET\"}", HTTPD_RESP_USE_STRLEN);
+        return ESP_OK;
+    }
+    if (s_ota.received + req->content_len > s_ota.size) {
+        xSemaphoreGive(s_ota_mutex);
+        httpd_resp_set_status(req, "413 Payload Too Large");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_send(req, "{\"success\":false,\"error\":\"TOO_MUCH_DATA\"}", HTTPD_RESP_USE_STRLEN);
+        return ESP_OK;
+    }
+
+    ota_pause_background_work("ota_chunk");
+    uint8_t *buf = heap_caps_malloc(4096, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (!buf) {
+        buf = heap_caps_malloc(4096, MALLOC_CAP_8BIT);
+    }
+    if (!buf) {
+        ota_set_last_error_locked("NO_MEMORY");
+        xSemaphoreGive(s_ota_mutex);
+        httpd_resp_set_status(req, "500 Internal Server Error");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_send(req, "{\"success\":false,\"error\":\"NO_MEMORY\"}", HTTPD_RESP_USE_STRLEN);
+        return ESP_OK;
+    }
+
+    const uint32_t start_received = s_ota.received;
+    size_t remain = req->content_len;
+    int64_t started = esp_timer_get_time();
+    int64_t last_data = started;
+    esp_err_t result = ESP_OK;
+    while (remain > 0) {
+        size_t want = remain > 4096 ? 4096 : remain;
+        int ret = httpd_req_recv(req, (char *)buf, want);
+        int64_t now = esp_timer_get_time();
+        if (ret > 0) {
+            result = esp_ota_write(s_ota.handle, buf, (size_t)ret);
+            if (result != ESP_OK) {
+                ota_set_last_error_locked(esp_err_to_name(result));
+                break;
+            }
+            mbedtls_sha256_update(&s_ota.sha_ctx, buf, (size_t)ret);
+            s_ota.received += (uint32_t)ret;
+            s_ota.last_write_us = now;
+            remain -= (size_t)ret;
+            last_data = now;
+            continue;
+        }
+        if (ret == HTTPD_SOCK_ERR_TIMEOUT) {
+            if ((now - last_data) / 1000 > 15000) {
+                result = ESP_ERR_TIMEOUT;
+                ota_set_last_error_locked("CHUNK_RECV_TIMEOUT");
+                break;
+            }
+            vTaskDelay(pdMS_TO_TICKS(10));
+            continue;
+        }
+        result = ESP_FAIL;
+        ota_set_last_error_locked("CHUNK_RECV_FAILED");
+        break;
+    }
+
+    heap_caps_free(buf);
+    if (result == ESP_OK) {
+        s_ota.chunks++;
+        ESP_LOGI(TAG, "[OTA] 分片完成 index=%lu 写入=%lu 已收=%lu/%lu 耗时=%lldms",
+                 (unsigned long)index_arg,
+                 (unsigned long)(s_ota.received - start_received),
+                 (unsigned long)s_ota.received,
+                 (unsigned long)s_ota.size,
+                 (long long)((esp_timer_get_time() - started) / 1000));
+        char resp[192];
+        snprintf(resp, sizeof(resp),
+                 "{\"success\":true,\"received\":%lu,\"size\":%lu,\"chunks\":%lu}",
+                 (unsigned long)s_ota.received,
+                 (unsigned long)s_ota.size,
+                 (unsigned long)s_ota.chunks);
+        xSemaphoreGive(s_ota_mutex);
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_send(req, resp, HTTPD_RESP_USE_STRLEN);
+        return ESP_OK;
+    }
+
+    ESP_LOGW(TAG, "[OTA] 分片失败 err=%s 已收=%lu/%lu", esp_err_to_name(result),
+             (unsigned long)s_ota.received,
+             (unsigned long)s_ota.size);
+    xSemaphoreGive(s_ota_mutex);
+    httpd_resp_set_status(req, result == ESP_ERR_TIMEOUT ? "408 Request Timeout" : "500 Internal Server Error");
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, "{\"success\":false,\"error\":\"CHUNK_WRITE_FAILED\"}", HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+static esp_err_t ota_finish_handler(httpd_req_t *req)
+{
+    set_cors_headers(req);
+    char session[OTA_SESSION_LEN] = {0};
+    ota_get_session_from_request(req, session, sizeof(session));
+    if (session[0] == '\0') {
+        char *body = read_request_body_alloc(req, 512);
+        cJSON *root = body ? cJSON_Parse(body) : NULL;
+        cJSON *session_item = root ? cJSON_GetObjectItem(root, "session") : NULL;
+        if (cJSON_IsString(session_item)) {
+            strlcpy(session, session_item->valuestring, sizeof(session));
+        }
+        if (root) cJSON_Delete(root);
+        if (body) heap_caps_free(body);
+    }
+
+    char resp[384];
+    int status = 200;
+    const char *error = NULL;
+    char actual_sha[65] = {0};
+    char partition_label[17] = {0};
+
+    if (xSemaphoreTake(s_ota_mutex, pdMS_TO_TICKS(30000)) != pdTRUE) {
+        status = 503;
+        error = "OTA_LOCK_TIMEOUT";
+        goto done;
+    }
+    if (!s_ota.active || session[0] == '\0' || strcmp(session, s_ota.session) != 0) {
+        xSemaphoreGive(s_ota_mutex);
+        status = 409;
+        error = "BAD_SESSION";
+        goto done;
+    }
+    if (s_ota.received != s_ota.size) {
+        ota_set_last_error_locked("SIZE_MISMATCH");
+        xSemaphoreGive(s_ota_mutex);
+        status = 409;
+        error = "SIZE_MISMATCH";
+        goto done;
+    }
+
+    uint8_t digest[32];
+    mbedtls_sha256_finish(&s_ota.sha_ctx, digest);
+    bytes_to_hex(digest, sizeof(digest), actual_sha, sizeof(actual_sha));
+    if (strcmp(actual_sha, s_ota.expected_sha256) != 0) {
+        ota_abort_locked("SHA256_MISMATCH");
+        xSemaphoreGive(s_ota_mutex);
+        status = 409;
+        error = "SHA256_MISMATCH";
+        goto done;
+    }
+
+    esp_err_t end_err = esp_ota_end(s_ota.handle);
+    if (end_err != ESP_OK) {
+        const char *end_name = esp_err_to_name(end_err);
+        ESP_LOGW(TAG, "[OTA] 结束校验失败 err=%s 已收=%lu/%lu",
+                 end_name,
+                 (unsigned long)s_ota.received,
+                 (unsigned long)s_ota.size);
+        mbedtls_sha256_free(&s_ota.sha_ctx);
+        memset(&s_ota, 0, sizeof(s_ota));
+        strlcpy(s_ota.last_error, end_name, sizeof(s_ota.last_error));
+        xSemaphoreGive(s_ota_mutex);
+        status = 500;
+        error = "OTA_END_FAILED";
+        goto done;
+    }
+    s_ota.update_started = false;
+
+    strlcpy(partition_label, s_ota.partition ? s_ota.partition->label : "", sizeof(partition_label));
+    esp_err_t boot_err = esp_ota_set_boot_partition(s_ota.partition);
+    if (boot_err != ESP_OK) {
+        ota_abort_locked(esp_err_to_name(boot_err));
+        xSemaphoreGive(s_ota_mutex);
+        status = 500;
+        error = "SET_BOOT_FAILED";
+        goto done;
+    }
+
+    uint32_t total = s_ota.size;
+    uint32_t chunks = s_ota.chunks;
+    int64_t elapsed_ms = (esp_timer_get_time() - s_ota.started_us) / 1000;
+    ESP_LOGI(TAG, "[OTA] 完成 分区=%s 字节=%lu 分片=%lu 耗时=%lldms sha=%s",
+             partition_label,
+             (unsigned long)total,
+             (unsigned long)chunks,
+             (long long)elapsed_ms,
+             actual_sha);
+    ota_clear_finished_locked();
+    xSemaphoreGive(s_ota_mutex);
+
+    snprintf(resp, sizeof(resp),
+             "{\"success\":true,\"message\":\"OTA completed\",\"partition\":\"%s\","
+             "\"size\":%lu,\"chunks\":%lu,\"sha256\":\"%s\",\"restart_ms\":1500}",
+             partition_label,
+             (unsigned long)total,
+             (unsigned long)chunks,
+             actual_sha);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, resp, HTTPD_RESP_USE_STRLEN);
+    schedule_restart(1500);
+    return ESP_OK;
+
+done:
+    if (error) {
+        if (status == 409) httpd_resp_set_status(req, "409 Conflict");
+        else if (status == 503) httpd_resp_set_status(req, "503 Service Unavailable");
+        else httpd_resp_set_status(req, "500 Internal Server Error");
+        snprintf(resp, sizeof(resp), "{\"success\":false,\"error\":\"%s\",\"sha256\":\"%s\"}", error, actual_sha);
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_send(req, resp, HTTPD_RESP_USE_STRLEN);
+    }
+    return ESP_OK;
+}
+
+static esp_err_t ota_cancel_handler(httpd_req_t *req)
+{
+    set_cors_headers(req);
+    char session[OTA_SESSION_LEN] = {0};
+    ota_get_session_from_request(req, session, sizeof(session));
+
+    if (xSemaphoreTake(s_ota_mutex, pdMS_TO_TICKS(30000)) != pdTRUE) {
+        httpd_resp_set_status(req, "503 Service Unavailable");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_send(req, "{\"success\":false,\"error\":\"OTA_LOCK_TIMEOUT\"}", HTTPD_RESP_USE_STRLEN);
+        return ESP_OK;
+    }
+    if (!s_ota.active) {
+        xSemaphoreGive(s_ota_mutex);
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_send(req, "{\"success\":true,\"message\":\"No active OTA\"}", HTTPD_RESP_USE_STRLEN);
+        return ESP_OK;
+    }
+    if (session[0] && strcmp(session, s_ota.session) != 0) {
+        xSemaphoreGive(s_ota_mutex);
+        httpd_resp_set_status(req, "409 Conflict");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_send(req, "{\"success\":false,\"error\":\"BAD_SESSION\"}", HTTPD_RESP_USE_STRLEN);
+        return ESP_OK;
+    }
+    ota_abort_locked("USER_CANCEL");
+    xSemaphoreGive(s_ota_mutex);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, "{\"success\":true,\"message\":\"OTA cancelled\"}", HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
 }
 
 static bool copy_json_string(cJSON *root, const char *key, char *out, size_t out_len)
@@ -1844,6 +2507,162 @@ static bool resolve_agent_key_from_user_key(const char *input_key, char *agent_k
     }
     heap_caps_free(response);
     return ok;
+}
+
+static bool wifi_ready_for_binding(void)
+{
+    wifi_ap_record_t ap = {0};
+    return esp_wifi_sta_get_ap_info(&ap) == ESP_OK;
+}
+
+static bool perform_device_binding_request(void)
+{
+    if (s_ext1[0] == '\0') {
+        ESP_LOGW(TAG, "[绑定] 跳过：本地没有API Key");
+        set_binding_status("no_key", false, true);
+        return false;
+    }
+    if (!wifi_ready_for_binding()) {
+        ESP_LOGW(TAG, "[绑定] 跳过：WiFi未连接");
+        return false;
+    }
+
+    cJSON *root = cJSON_CreateObject();
+    if (!root) {
+        ESP_LOGW(TAG, "[绑定] 创建请求JSON失败：内存不足");
+        return false;
+    }
+    cJSON_AddStringToObject(root, "version", s_firmware_version);
+    cJSON_AddStringToObject(root, "bin_id", s_bin_id);
+    cJSON_AddStringToObject(root, "device_id", s_device_id);
+    cJSON_AddStringToObject(root, "api_key", s_ext1);
+    cJSON_AddStringToObject(root, "wifi_ssid", s_wifi_ssid);
+    cJSON_AddStringToObject(root, "wifi_pwd", s_wifi_password);
+    char *body = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    if (!body) {
+        ESP_LOGW(TAG, "[绑定] 序列化请求失败：内存不足");
+        return false;
+    }
+
+    const size_t response_cap = 4096;
+    char *response = (char *)heap_caps_calloc(1, response_cap, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!response) {
+        response = (char *)heap_caps_calloc(1, response_cap, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    }
+    if (!response) {
+        free(body);
+        ESP_LOGW(TAG, "[绑定] 分配响应缓冲失败：内存不足");
+        return false;
+    }
+    http_collect_ctx_t collect = {
+        .buf = response,
+        .cap = response_cap,
+        .len = 0,
+    };
+    esp_http_client_config_t cfg = {
+        .url = "http://api.espai2.fun/devices/add",
+        .timeout_ms = 10000,
+        .buffer_size = 1024,
+        .buffer_size_tx = 512,
+        .event_handler = collect_http_event,
+        .user_data = &collect,
+    };
+    esp_http_client_handle_t client = esp_http_client_init(&cfg);
+    if (!client) {
+        heap_caps_free(response);
+        free(body);
+        ESP_LOGW(TAG, "[绑定] HTTP客户端初始化失败");
+        return false;
+    }
+
+    ESP_LOGI(TAG, "[绑定] 开始绑定设备 device_id=%s ssid=%s key=%c%c%c%c****",
+             s_device_id, s_wifi_ssid, s_ext1[0], s_ext1[1], s_ext1[2], s_ext1[3]);
+    set_binding_status("binding", false, true);
+    esp_http_client_set_method(client, HTTP_METHOD_POST);
+    esp_http_client_set_header(client, "Content-Type", "application/json");
+    esp_http_client_set_post_field(client, body, strlen(body));
+
+    esp_err_t err = esp_http_client_perform(client);
+    int status = esp_http_client_get_status_code(client);
+    esp_http_client_cleanup(client);
+    free(body);
+
+    bool success = false;
+    char message[128] = "";
+    if (err == ESP_OK && status == 200 && collect.len > 0) {
+        // The server may include a very large memory field. The beginning of
+        // the response is enough for the success flag; do not fail only
+        // because the tail was truncated by our bounded buffer.
+        if (strstr(response, "\"success\":true")) {
+            success = true;
+        }
+        copy_after_marker(response, "\"message\":\"", message, sizeof(message));
+    }
+
+    if (success) {
+        ESP_LOGI(TAG, "[绑定] 设备绑定成功 message=%s", message[0] ? message : "(none)");
+        set_binding_status("bound", true, true);
+        heap_caps_free(response);
+        return true;
+    }
+
+    ESP_LOGW(TAG, "[绑定] 设备绑定失败 err=%s status=%d response_prefix=%.160s",
+             esp_err_to_name(err), status, response[0] ? response : "(empty)");
+    set_binding_status("failed", false, true);
+    heap_caps_free(response);
+    return false;
+}
+
+static void device_binding_task(void *arg)
+{
+    const char *reason = (const char *)arg;
+    ESP_LOGI(TAG, "[绑定] 后台绑定任务启动 reason=%s", reason ? reason : "unknown");
+    for (int i = 0; i < 60; ++i) {
+        if (s_ext1[0] == '\0') {
+            set_binding_status("no_key", false, true);
+            goto done;
+        }
+        if (wifi_ready_for_binding() && !is_ota_active() && !esp_ai_get_upload_active() && !esp_ai_get_busy()) {
+            break;
+        }
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+    if (!wifi_ready_for_binding() || is_ota_active() || esp_ai_get_upload_active() || esp_ai_get_busy()) {
+        ESP_LOGW(TAG, "[绑定] 当前业务忙或网络未就绪，延后到下次触发");
+        set_binding_status("pending", false, true);
+        goto done;
+    }
+    perform_device_binding_request();
+
+done:
+    s_binding_task_active = false;
+    vTaskDelete(NULL);
+}
+
+static void schedule_device_binding(const char *reason)
+{
+    if (s_ext1[0] == '\0') {
+        set_binding_status("no_key", false, true);
+        ESP_LOGI(TAG, "[绑定] 不安排绑定：本地没有API Key");
+        return;
+    }
+    if (s_device_bound) {
+        ESP_LOGI(TAG, "[绑定] 已绑定，跳过 reason=%s", reason ? reason : "unknown");
+        return;
+    }
+    if (s_binding_task_active) {
+        ESP_LOGI(TAG, "[绑定] 已有绑定任务进行中，跳过 reason=%s", reason ? reason : "unknown");
+        return;
+    }
+    s_binding_task_active = true;
+    set_binding_status("pending", false, true);
+    BaseType_t ok = xTaskCreate(device_binding_task, "device_bind", 10240, (void *)reason, 4, NULL);
+    if (ok != pdPASS) {
+        s_binding_task_active = false;
+        set_binding_status("failed", false, true);
+        ESP_LOGW(TAG, "[绑定] 创建后台绑定任务失败");
+    }
 }
 
 static const uint8_t *find_bytes(const uint8_t *haystack, size_t haystack_len,
@@ -2858,19 +3677,31 @@ cleanup:
 static esp_err_t api_status_get_handler(httpd_req_t *req)
 {
     set_cors_headers(req);
-    char resp_str[1024];
+    char resp_str[1800];
     otakulink_system_snapshot_t sys;
     otakulink_system_get_snapshot(&sys);
     bool ws_connected = esp_ai_is_connected();
     bool busy = esp_ai_get_busy();
+    bool ota_active = false;
+    uint32_t ota_received = 0;
+    uint32_t ota_size = 0;
+    if (s_ota_mutex && xSemaphoreTake(s_ota_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+        ota_active = s_ota.active;
+        ota_received = s_ota.received;
+        ota_size = s_ota.size;
+        xSemaphoreGive(s_ota_mutex);
+    }
 
     snprintf(resp_str, sizeof(resp_str),
              "{\"success\":true,\"ws_connected\":%s,\"asr_ing\":false,"
              "\"session_status\":\"%s\",\"session_id\":\"\",\"busy\":%s,"
              "\"can_wakeup\":%s,\"free_sram\":%lu,\"free_psram\":%lu,"
              "\"max_sram_block\":%lu,\"min_sram\":%lu,\"rssi\":%d,"
+             "\"device_id\":\"%s\",\"has_apikey\":%s,"
+             "\"bound\":%s,\"binding_status\":\"%s\","
              "\"business_ws_connected\":%s,\"business_ws_paused\":%s,"
              "\"upload_active\":%s,\"network_recovery_active\":%s,"
+             "\"ota_active\":%s,\"ota_received\":%lu,\"ota_size\":%lu,"
              "\"wifi_disconnects\":%lu,\"wifi_stack_resets\":%lu,"
              "\"business_ws_connects\":%lu,\"business_ws_disconnects\":%lu,"
              "\"business_ws_errors\":%lu,\"low_mem_events\":%lu}",
@@ -2883,10 +3714,17 @@ static esp_err_t api_status_get_handler(httpd_req_t *req)
              (unsigned long)sys.max_sram_block,
              (unsigned long)sys.min_sram,
              sys.rssi,
+             s_device_id,
+             s_api_key[0] ? "true" : "false",
+             s_device_bound ? "true" : "false",
+             s_binding_status,
              sys.business_ws_connected ? "true" : "false",
              sys.business_ws_paused ? "true" : "false",
              sys.upload_active ? "true" : "false",
              sys.network_recovery_active ? "true" : "false",
+             ota_active ? "true" : "false",
+             (unsigned long)ota_received,
+             (unsigned long)ota_size,
              (unsigned long)sys.wifi_disconnects,
              (unsigned long)sys.wifi_stack_resets,
              (unsigned long)sys.business_ws_connects,
@@ -2896,11 +3734,12 @@ static esp_err_t api_status_get_handler(httpd_req_t *req)
 
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, resp_str, HTTPD_RESP_USE_STRLEN);
-    ESP_LOGI(TAG, "[HTTP] /api/status 已返回 AI=%d 忙碌=%d 业务WS=%d 上传=%d SRAM=%luKB PSRAM=%luKB 最大连续=%luKB 信号=%d",
+    ESP_LOGI(TAG, "[HTTP] /api/status 已返回 AI=%d 忙碌=%d 业务WS=%d 上传=%d 绑定=%s SRAM=%luKB PSRAM=%luKB 最大连续=%luKB 信号=%d",
              ws_connected ? 1 : 0,
              busy ? 1 : 0,
              sys.business_ws_connected ? 1 : 0,
              sys.upload_active ? 1 : 0,
+             s_binding_status,
              (unsigned long)(sys.free_sram / 1024),
              (unsigned long)(sys.free_psram / 1024),
              (unsigned long)(sys.max_sram_block / 1024),
@@ -2962,7 +3801,10 @@ static esp_err_t get_voice_config_handler(httpd_req_t *req)
     cJSON_AddStringToObject(root, "voiceId", s_voice_id);
     cJSON_AddStringToObject(root, "personality", s_personality);
     cJSON_AddNumberToObject(root, "timestamp", (double)esp_log_timestamp());
-    cJSON_AddStringToObject(root, "device_id", "98:A3:16:E3:F9:10");
+    cJSON_AddStringToObject(root, "device_id", s_device_id);
+    cJSON_AddBoolToObject(root, "has_apikey", s_api_key[0] != '\0');
+    cJSON_AddBoolToObject(root, "bound", s_device_bound);
+    cJSON_AddStringToObject(root, "binding_status", s_binding_status);
     char *json = cJSON_PrintUnformatted(root);
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, json, HTTPD_RESP_USE_STRLEN);
@@ -3014,12 +3856,20 @@ static esp_err_t apikey_handler(httpd_req_t *req)
         cJSON *root = cJSON_CreateObject();
         cJSON_AddBoolToObject(root, "success", true);
         cJSON_AddBoolToObject(root, "has_apikey", has_key);
+        cJSON_AddStringToObject(root, "device_id", s_device_id);
+        cJSON_AddBoolToObject(root, "bound", s_device_bound);
+        cJSON_AddStringToObject(root, "binding_status", s_binding_status);
         if (preview[0]) cJSON_AddStringToObject(root, "apikey_preview", preview);
         char *json = cJSON_PrintUnformatted(root);
         httpd_resp_set_type(req, "application/json");
         httpd_resp_send(req, json, HTTPD_RESP_USE_STRLEN);
         free(json);
         cJSON_Delete(root);
+        return ESP_OK;
+    }
+
+    if (is_ota_active()) {
+        send_ota_busy_response(req);
         return ESP_OK;
     }
 
@@ -3051,12 +3901,21 @@ static esp_err_t apikey_handler(httpd_req_t *req)
     if (resolved_from_user_key) {
         strlcpy(s_user_api_key, submitted_key, sizeof(s_user_api_key));
         esp_ai_nvs_save("user_api_key", s_user_api_key);
+    } else {
+        s_user_api_key[0] = '\0';
+        esp_ai_nvs_save("user_api_key", "");
     }
     s_ai_cfg.server.api_key = s_api_key;
     s_ai_cfg.server.ext1 = s_ext1;
+    s_ai_cfg.server.device_id = s_device_id;
     esp_ai_nvs_save("api_key", s_api_key);
     esp_ai_nvs_save("ext1", s_ext1);
-    ESP_LOGI(TAG, "[HTTP] API Key已保存 来自用户Key解析=%d 准备重启", resolved_from_user_key ? 1 : 0);
+    esp_ai_nvs_save("device_id", s_device_id);
+    set_binding_status("pending", false, true);
+    schedule_device_binding("apikey_saved");
+    refresh_business_ws_config("apikey_saved");
+    ESP_LOGI(TAG, "[HTTP] API Key已保存 来自用户Key解析=%d device_id=%s 准备重启",
+             resolved_from_user_key ? 1 : 0, s_device_id);
 
     httpd_resp_set_type(req, "application/json");
     if (resolved_from_user_key) {
@@ -3300,6 +4159,10 @@ static esp_err_t screensaver_status_handler(httpd_req_t *req)
 static esp_err_t upload_post_handler(httpd_req_t *req)
 {
     set_cors_headers(req);
+    if (is_ota_active()) {
+        send_ota_busy_response(req);
+        return ESP_OK;
+    }
     notify_activity("upload");
     esp_ai_set_upload_active(true);
 
@@ -3596,6 +4459,10 @@ esp_err_t wakeup_get_handler(httpd_req_t *req)
 {
     ESP_LOGI(TAG, "收到 HTTP 唤醒请求");
     set_cors_headers(req);
+    if (is_ota_active()) {
+        send_ota_busy_response(req);
+        return ESP_OK;
+    }
     notify_activity("wakeup");
     if (!esp_ai_is_connected()) {
         httpd_resp_set_status(req, "503 Service Unavailable");
@@ -3620,6 +4487,10 @@ esp_err_t wakeup_get_handler(httpd_req_t *req)
 static esp_err_t char_text_post_handler(httpd_req_t *req)
 {
     set_cors_headers(req);
+    if (is_ota_active()) {
+        send_ota_busy_response(req);
+        return ESP_OK;
+    }
     notify_activity("char_text");
 
     if (!esp_ai_is_connected()) {
@@ -3785,6 +4656,10 @@ static esp_err_t char_text_post_handler(httpd_req_t *req)
 esp_err_t chat_post_handler(httpd_req_t *req)
 {
     set_cors_headers(req);
+    if (is_ota_active()) {
+        send_ota_busy_response(req);
+        return ESP_OK;
+    }
     notify_activity("chat");
     char buf[256];
     if (read_request_body(req, buf, sizeof(buf)) != ESP_OK) return ESP_FAIL;
@@ -3832,6 +4707,11 @@ static const httpd_uri_t chat_uri = { .uri = "/api/chat", .method = HTTP_POST, .
 static const httpd_uri_t char_text_uri = { .uri = "/api/char_text", .method = HTTP_POST, .handler = char_text_post_handler, .user_ctx = NULL };
 static const httpd_uri_t api_upload_uri = { .uri = "/api/upload", .method = HTTP_POST, .handler = upload_post_handler, .user_ctx = NULL };
 static const httpd_uri_t upload_uri = { .uri = "/upload", .method = HTTP_POST, .handler = upload_post_handler, .user_ctx = NULL };
+static const httpd_uri_t ota_status_uri = { .uri = "/api/ota/status", .method = HTTP_GET, .handler = ota_status_handler, .user_ctx = NULL };
+static const httpd_uri_t ota_start_uri = { .uri = "/api/ota/start", .method = HTTP_POST, .handler = ota_start_handler, .user_ctx = NULL };
+static const httpd_uri_t ota_chunk_uri = { .uri = "/api/ota/chunk", .method = HTTP_POST, .handler = ota_chunk_handler, .user_ctx = NULL };
+static const httpd_uri_t ota_finish_uri = { .uri = "/api/ota/finish", .method = HTTP_POST, .handler = ota_finish_handler, .user_ctx = NULL };
+static const httpd_uri_t ota_cancel_uri = { .uri = "/api/ota/cancel", .method = HTTP_POST, .handler = ota_cancel_handler, .user_ctx = NULL };
 static const httpd_uri_t api_apikey_uri = { .uri = "/api/apikey", .method = HTTP_GET, .handler = apikey_handler, .user_ctx = NULL };
 static const httpd_uri_t api_apikey_post_uri = { .uri = "/api/apikey", .method = HTTP_POST, .handler = apikey_handler, .user_ctx = NULL };
 static const httpd_uri_t apikey_post_uri = { .uri = "/apikey", .method = HTTP_POST, .handler = apikey_handler, .user_ctx = NULL };
@@ -3857,7 +4737,7 @@ static httpd_handle_t start_webserver(void)
     }
 
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    config.max_uri_handlers = 36;
+    config.max_uri_handlers = 48;
     config.stack_size = 8192;
     config.recv_wait_timeout = 30;
     config.send_wait_timeout = 30;
@@ -3885,6 +4765,11 @@ static httpd_handle_t start_webserver(void)
         register_route(server, &char_text_uri);
         register_route(server, &api_upload_uri);
         register_route(server, &upload_uri);
+        register_route(server, &ota_status_uri);
+        register_route(server, &ota_start_uri);
+        register_route(server, &ota_chunk_uri);
+        register_route(server, &ota_finish_uri);
+        register_route(server, &ota_cancel_uri);
         register_route(server, &api_apikey_uri);
         register_route(server, &api_apikey_post_uri);
         register_route(server, &apikey_post_uri);
@@ -3917,6 +4802,7 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base, int32_t e
         start_time_sync_if_needed();
         start_webserver();
         request_ai_start();
+        schedule_device_binding("wifi_got_ip");
     }
 }
 
@@ -3924,10 +4810,12 @@ void app_main(void)
 {
     s_pending_show_mutex = xSemaphoreCreateMutex();
     s_char_text_mutex = xSemaphoreCreateMutex();
+    s_ota_mutex = xSemaphoreCreateMutex();
     otakulink_reminder_init();
     notify_activity("boot");
 
     nvs_flash_init();
+    mark_current_app_valid_if_pending();
     load_runtime_config();
 
     if (esp_ai_ui_init() == ESP_OK) {

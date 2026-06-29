@@ -172,3 +172,11 @@
 - 编译通过并烧录到 `/dev/cu.usbmodem11101`。
 - 连续 10 轮 `/api/char_text` 稳定性测试全部通过：HTTP 返回 200，SSE 正常 `round_end/end`，设备未重启，`wifi_stack_resets=0`、`business_ws_errors=0`、`low_mem_events=0`。
 - 测试后状态：ESP-AI connected，业务 WS 自动恢复，`free_sram≈96KB`，业务 WS 暂停时约 `102KB`，`min_sram≈95KB`，未观察到 SRAM 持续下降。
+
+## 2026-06-29 设备绑定栈溢出修复
+
+- 定位到启动反复重启原因：后台设备绑定任务 `device_bind` 栈溢出，日志为 `A stack overflow in task device_bind`。
+- 修复方式：`devices/add` 响应缓冲从任务栈迁移到 heap/PSRAM，绑定任务栈从 6144 提升到 10240，并避免失败日志打印超长响应。
+- 编译通过并烧录到 `/dev/cu.usbmodem11101`。
+- 启动验证通过：未再出现 `device_bind` 栈溢出，设备加载 `binding_status=bound` 后跳过重复绑定。
+- HTTP 验证通过：`/api/status` 返回 `ws_connected=true`、`bound=true`、`business_ws_connected=true`，SRAM 约 92KB。
